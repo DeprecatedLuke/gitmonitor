@@ -1,0 +1,44 @@
+# dependencies
+node_modules/
+
+# bun install/cache
+.bun-install/
+.bun-tmp/
+
+# output
+dist/
+out/
+*.tgz
+
+# patch/merge artifacts
+*.orig
+*.rej
+*.bak
+*.swp
+
+# code coverage
+coverage/
+*.lcov
+
+# logs
+logs/
+*.log
+report.[0-9]*.[0-9]*.[0-9]*.[0-9]*.json
+
+# dotenv
+.env
+.env.development.local
+.env.test.local
+.env.production.local
+.env.local
+
+# caches
+.eslintcache
+.cache/
+*.tsbuildinfo
+
+# IntelliJ
+.idea/
+
+# macOS
+.DS_Store

@@ -1,0 +1,12 @@
+telemetry = false
+
+[install]
+linker = "isolated"
+exact = true
+saveTextLockfile = true
+
+[loader]
+".md" = "text"
+
+[run]
+bun = true
