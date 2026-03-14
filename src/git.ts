@@ -269,3 +269,67 @@ export async function getFileDiff(repoPath: string, filePath: string, status: st
 
 	return parts.join("\n") || "(no diff available)";
 }
+
+// ── Commit detail ────────────────────────────────────────────────────────────────
+
+export type CommitDetail = {
+	hash: string;
+	subject: string;
+	body: string;
+	author: string;
+	date: string;
+	files: FileChange[];
+};
+
+/**
+ * Get full detail for a single commit: message, author, date, and changed files with stats.
+ */
+export async function getCommitDetail(repoPath: string, hash: string): Promise<CommitDetail> {
+	const cwd = path.resolve(repoPath);
+
+	const [infoResult, numstatResult] = await Promise.all([
+		$`git show --no-patch --format=%H%x00%s%x00%b%x00%an%x00%ar ${hash}`.cwd(cwd).quiet().nothrow(),
+		$`git diff-tree --no-commit-id -r --numstat ${hash}`.cwd(cwd).quiet().nothrow(),
+	]);
+
+	let subject = hash;
+	let body = "";
+	let author = "";
+	let date = "";
+	let fullHash = hash;
+
+	if (infoResult.exitCode === 0) {
+		const parts = infoResult.text().trim().split("\0");
+		fullHash = parts[0] ?? hash;
+		subject = parts[1] ?? hash;
+		body = (parts[2] ?? "").trim();
+		author = parts[3] ?? "";
+		date = parts[4] ?? "";
+	}
+
+	const files: FileChange[] = [];
+	if (numstatResult.exitCode === 0) {
+		const raw = numstatResult.text().trim();
+		if (raw) {
+			for (const line of raw.split("\n")) {
+				const [addedStr, deletedStr, ...pathParts] = line.split("\t");
+				const filePath = pathParts.join("\t");
+				const added = addedStr === "-" ? 0 : parseInt(addedStr, 10) || 0;
+				const deleted = deletedStr === "-" ? 0 : parseInt(deletedStr, 10) || 0;
+				files.push({ path: filePath, added, deleted, status: "M" });
+			}
+		}
+	}
+
+	return { hash: fullHash, subject, body, author, date, files };
+}
+
+/**
+ * Get the diff for a single file at a specific commit.
+ */
+export async function getCommitFileDiff(repoPath: string, hash: string, filePath: string): Promise<string> {
+	const cwd = path.resolve(repoPath);
+	const result = await $`git show ${hash} -- ${filePath}`.cwd(cwd).quiet().nothrow();
+	if (result.exitCode !== 0) return "(no diff available)";
+	return result.text();
+}

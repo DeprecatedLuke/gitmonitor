@@ -1,6 +1,6 @@
 import terminalKit from "terminal-kit";
 import type { RepoInfo } from "./git";
-import { getFileDiff } from "./git";
+import { getFileDiff, getCommitDetail, getCommitFileDiff } from "./git";
 import * as logger from "./logger";
 
 const term = terminalKit.terminal;
@@ -27,17 +27,29 @@ type Line = {
 	text: string;
 	/** Index into RepoInfo.changes, set on change lines */
 	changeIndex?: number;
+	/** Index into RepoInfo.commits, set on commit lines */
+	commitIndex?: number;
+	/** Commit hash, set on file lines within commit detail view */
+	commitHash?: string;
 };
 
 // --- Diff view state ---
 
 type DiffView = {
 	repoIndex: number;
-	changeIndex: number;
 	lines: Line[];
 	cursor: number;
 	scroll: number;
 	/** Which mode to return to */
+	previousMode: "list" | "detail" | "commitView";
+};
+
+type CommitView = {
+	repoIndex: number;
+	commitIndex: number;
+	lines: Line[];
+	cursor: number;
+	scroll: number;
 	previousMode: "list" | "detail";
 };
 
@@ -50,6 +62,7 @@ type ViewState = {
 	expanded: Set<number>;
 	detailRepo: number;
 	diffView: DiffView | null;
+	commitView: CommitView | null;
 };
 
 // --- Line building ---
@@ -119,13 +132,15 @@ function buildListLines(state: ViewState): Line[] {
 			if (repo.commits.length === 0) {
 				lines.push({ type: "message", repoIndex: i, text: `     ${DIM}No commits yet${RESET}` });
 			} else {
-				for (const commit of repo.commits) {
+				for (let ci = 0; ci < repo.commits.length; ci++) {
+					const commit = repo.commits[ci];
 					const hash = `${YELLOW}${commit.hash}${RESET}`;
 					const subject = commit.subject;
 					const date = `${DIM}${commit.date}${RESET}`;
 					lines.push({
 						type: "commit",
 						repoIndex: i,
+						commitIndex: ci,
 						text: `     ${hash} ${subject}  ${date}`,
 					});
 				}
@@ -174,13 +189,15 @@ function buildDetailLines(state: ViewState): Line[] {
 	if (repo.commits.length === 0) {
 		lines.push({ type: "message", repoIndex: state.detailRepo, text: `   ${DIM}No commits yet${RESET}` });
 	} else {
-		for (const commit of repo.commits) {
+		for (let ci = 0; ci < repo.commits.length; ci++) {
+			const commit = repo.commits[ci];
 			const hash = `${YELLOW}${commit.hash}${RESET}`;
 			const author = `${MAGENTA}${commit.author}${RESET}`;
 			const date = `${DIM}${commit.date}${RESET}`;
 			lines.push({
 				type: "commit",
 				repoIndex: state.detailRepo,
+				commitIndex: ci,
 				text: `   ${hash} ${commit.subject}  ${author}  ${date}`,
 			});
 		}
@@ -214,8 +231,42 @@ function buildDiffLines(repoIndex: number, filePath: string, diffText: string): 
 	return lines;
 }
 
+function buildCommitDetailLines(
+	repoIndex: number,
+	detail: { hash: string; subject: string; body: string; author: string; date: string; files: { path: string; added: number; deleted: number; status: string }[] },
+): Line[] {
+	const lines: Line[] = [];
+	lines.push({ type: "header", repoIndex, text: ` ${BOLD}${YELLOW}${detail.hash.slice(0, 7)}${RESET} ${detail.subject}` });
+	lines.push({ type: "empty", repoIndex, text: "" });
+	lines.push({ type: "message", repoIndex, text: ` ${MAGENTA}${detail.author}${RESET}  ${DIM}${detail.date}${RESET}` });
+	if (detail.body) {
+		lines.push({ type: "empty", repoIndex, text: "" });
+		for (const bodyLine of detail.body.split("\n")) {
+			lines.push({ type: "message", repoIndex, text: ` ${DIM}${bodyLine}${RESET}` });
+		}
+	}
+	lines.push({ type: "empty", repoIndex, text: "" });
+	lines.push({ type: "section", repoIndex, text: ` ${BOLD}Files (${detail.files.length}):${RESET}` });
+	for (let fi = 0; fi < detail.files.length; fi++) {
+		const f = detail.files[fi];
+		const parts: string[] = [];
+		if (f.added > 0) parts.push(`${GREEN}+${f.added}${RESET}`);
+		if (f.deleted > 0) parts.push(`${RED}-${f.deleted}${RESET}`);
+		const diffStr = parts.length > 0 ? `  ${parts.join(" ")}` : "";
+		lines.push({
+			type: "change",
+			repoIndex,
+			changeIndex: fi,
+			commitHash: detail.hash,
+			text: `   ${f.path}${diffStr}`,
+		});
+	}
+	return lines;
+}
+
 function buildLines(state: ViewState): Line[] {
 	if (state.diffView) return state.diffView.lines;
+	if (state.commitView) return state.commitView.lines;
 	if (state.detailRepo >= 0) return buildDetailLines(state);
 	return buildListLines(state);
 }
@@ -250,15 +301,22 @@ function truncateAnsi(s: string, maxWidth: number): string {
 
 function getMode(state: ViewState): string {
 	if (state.diffView) return "diff";
+	if (state.commitView) return "commit";
 	if (state.detailRepo >= 0) return "detail";
 	return "list";
+}
+
+/** Get the active cursor/scroll for the current view. */
+function activeView(state: ViewState): { cursor: number; scroll: number } {
+	if (state.diffView) return state.diffView;
+	if (state.commitView) return state.commitView;
+	return state;
 }
 
 function render(state: ViewState, lines: Line[]): void {
 	const w = term.width;
 	const h = term.height;
-	const scroll = state.diffView ? state.diffView.scroll : state.scroll;
-	const cursor = state.diffView ? state.diffView.cursor : state.cursor;
+	const { scroll, cursor } = activeView(state);
 
 	if (w < 40 || h < 10) {
 		term.clear();
@@ -313,18 +371,11 @@ function render(state: ViewState, lines: Line[]): void {
 // --- Scroll management ---
 
 function ensureCursorVisible(state: ViewState, viewHeight: number): void {
-	if (state.diffView) {
-		if (state.diffView.cursor < state.diffView.scroll) {
-			state.diffView.scroll = state.diffView.cursor;
-		} else if (state.diffView.cursor >= state.diffView.scroll + viewHeight) {
-			state.diffView.scroll = state.diffView.cursor - viewHeight + 1;
-		}
-		return;
-	}
-	if (state.cursor < state.scroll) {
-		state.scroll = state.cursor;
-	} else if (state.cursor >= state.scroll + viewHeight) {
-		state.scroll = state.cursor - viewHeight + 1;
+	const view = activeView(state);
+	if (view.cursor < view.scroll) {
+		view.scroll = view.cursor;
+	} else if (view.cursor >= view.scroll + viewHeight) {
+		view.scroll = view.cursor - viewHeight + 1;
 	}
 }
 
@@ -335,15 +386,6 @@ function repoIndexForLine(lines: Line[], lineIndex: number): number {
 	return lines[lineIndex].repoIndex;
 }
 
-function isHeaderLine(lines: Line[], lineIndex: number): boolean {
-	if (lineIndex < 0 || lineIndex >= lines.length) return false;
-	return lines[lineIndex].type === "header";
-}
-
-function isChangeLine(lines: Line[], lineIndex: number): boolean {
-	if (lineIndex < 0 || lineIndex >= lines.length) return false;
-	return lines[lineIndex].type === "change";
-}
 
 // --- Main entry point ---
 
@@ -357,6 +399,7 @@ export async function startTui(repos: RepoInfo[], onRefresh: () => Promise<RepoI
 		expanded: new Set(),
 		detailRepo: -1,
 		diffView: null,
+		commitView: null,
 	};
 
 	let lines = buildLines(state);
@@ -364,24 +407,14 @@ export async function startTui(repos: RepoInfo[], onRefresh: () => Promise<RepoI
 	function fullRender(): void {
 		lines = buildLines(state);
 		const viewHeight = term.height - 1;
-		if (state.diffView) {
-			if (state.diffView.lines.length === 0) {
-				state.diffView.cursor = 0;
-				state.diffView.scroll = 0;
-			} else {
-				state.diffView.cursor = Math.max(0, Math.min(state.diffView.cursor, state.diffView.lines.length - 1));
-			}
-			ensureCursorVisible(state, viewHeight);
+		const view = activeView(state);
+		if (lines.length === 0) {
+			view.cursor = 0;
+			view.scroll = 0;
 		} else {
-			// Clamp cursor
-			if (lines.length === 0) {
-				state.cursor = 0;
-				state.scroll = 0;
-			} else {
-				state.cursor = Math.max(0, Math.min(state.cursor, lines.length - 1));
-			}
-			ensureCursorVisible(state, viewHeight);
+			view.cursor = Math.max(0, Math.min(view.cursor, lines.length - 1));
 		}
+		ensureCursorVisible(state, viewHeight);
 		render(state, lines);
 	}
 
@@ -408,36 +441,59 @@ export async function startTui(repos: RepoInfo[], onRefresh: () => Promise<RepoI
 		term.grabInput(false);
 	}
 
-	async function openDiff(ri: number, ci: number): Promise<void> {
+	async function openDiff(ri: number, filePath: string, status: string): Promise<void> {
 		const repo = state.repos[ri];
-		if (!repo || ci < 0 || ci >= repo.changes.length) return;
-
-		const change = repo.changes[ci];
-		const diffText = await getFileDiff(repo.path, change.path, change.status);
-		const diffLines = buildDiffLines(ri, change.path, diffText);
-
-		state.diffView = {
-			repoIndex: ri,
-			changeIndex: ci,
-			lines: diffLines,
-			cursor: 0,
-			scroll: 0,
-			previousMode: state.detailRepo >= 0 ? "detail" : "list",
-		};
+		if (!repo) return;
+		const diffText = await getFileDiff(repo.path, filePath, status);
+		const diffLines = buildDiffLines(ri, filePath, diffText);
+		let previousMode: DiffView["previousMode"] = "list";
+		if (state.commitView) previousMode = "commitView";
+		else if (state.detailRepo >= 0) previousMode = "detail";
+		state.diffView = { repoIndex: ri, lines: diffLines, cursor: 0, scroll: 0, previousMode };
 		lines = diffLines;
+		render(state, lines);
+	}
+
+	async function openCommitFileDiff(ri: number, hash: string, filePath: string): Promise<void> {
+		const repo = state.repos[ri];
+		if (!repo) return;
+		const diffText = await getCommitFileDiff(repo.path, hash, filePath);
+		const diffLines = buildDiffLines(ri, filePath, diffText);
+		state.diffView = { repoIndex: ri, lines: diffLines, cursor: 0, scroll: 0, previousMode: "commitView" };
+		lines = diffLines;
+		render(state, lines);
+	}
+
+	async function openCommit(ri: number, ci: number): Promise<void> {
+		const repo = state.repos[ri];
+		if (!repo || ci < 0 || ci >= repo.commits.length) return;
+		const commit = repo.commits[ci];
+		const detail = await getCommitDetail(repo.path, commit.hash);
+		const commitLines = buildCommitDetailLines(ri, detail);
+		const previousMode: CommitView["previousMode"] = state.detailRepo >= 0 ? "detail" : "list";
+		state.commitView = { repoIndex: ri, commitIndex: ci, lines: commitLines, cursor: 0, scroll: 0, previousMode };
+		lines = commitLines;
 		render(state, lines);
 	}
 
 	function closeDiff(): void {
 		if (!state.diffView) return;
 		const prev = state.diffView.previousMode;
-		const ri = state.diffView.repoIndex;
 		state.diffView = null;
-
-		if (prev === "detail") {
-			state.detailRepo = ri;
+		if (prev === "commitView") {
+			// Return to commit view — lines are still there
+			if (state.commitView) {
+				lines = state.commitView.lines;
+				render(state, lines);
+				return;
+			}
 		}
-		// Rebuild and restore cursor to the change line
+		fullRender();
+	}
+
+	function closeCommit(): void {
+		if (!state.commitView) return;
+		state.commitView = null;
 		fullRender();
 	}
 
@@ -452,124 +508,113 @@ export async function startTui(repos: RepoInfo[], onRefresh: () => Promise<RepoI
 
 	term.on("key", async (name: string) => {
 		const viewHeight = term.height - 1;
+		const view = activeView(state);
 
-		// --- Diff view handles its own keys ---
-		if (state.diffView) {
-			switch (name) {
-				case "q":
-				case "CTRL_C":
-					cleanup();
-					term.processExit(0);
-					resolve();
-					return;
-				case "UP":
-				case "k":
-					if (state.diffView.cursor > 0) {
-						state.diffView.cursor--;
-						ensureCursorVisible(state, viewHeight);
-						render(state, lines);
-					}
-					return;
-				case "DOWN":
-				case "j":
-					if (state.diffView.cursor < state.diffView.lines.length - 1) {
-						state.diffView.cursor++;
-						ensureCursorVisible(state, viewHeight);
-						render(state, lines);
-					}
-					return;
-				case "LEFT":
-				case "h":
-				case "ESCAPE":
-					closeDiff();
-					return;
-				case "PAGE_UP":
-					state.diffView.cursor = Math.max(0, state.diffView.cursor - viewHeight);
-					ensureCursorVisible(state, viewHeight);
-					render(state, lines);
-					return;
-				case "PAGE_DOWN":
-					state.diffView.cursor = Math.min(state.diffView.lines.length - 1, state.diffView.cursor + viewHeight);
-					ensureCursorVisible(state, viewHeight);
-					render(state, lines);
-					return;
-				default:
-					return;
-			}
-		}
-
-		// --- List / detail view ---
+		// --- Universal keys ---
 		switch (name) {
 			case "q":
-			case "CTRL_C": {
+			case "CTRL_C":
 				cleanup();
 				term.processExit(0);
 				resolve();
 				return;
-			}
-
 			case "UP":
-			case "k": {
-				if (state.cursor > 0) {
-					state.cursor--;
+			case "k":
+				if (view.cursor > 0) {
+					view.cursor--;
 					ensureCursorVisible(state, viewHeight);
 					render(state, lines);
 				}
 				return;
-			}
-
 			case "DOWN":
-			case "j": {
-				if (state.cursor < lines.length - 1) {
-					state.cursor++;
+			case "j":
+				if (view.cursor < lines.length - 1) {
+					view.cursor++;
 					ensureCursorVisible(state, viewHeight);
 					render(state, lines);
 				}
 				return;
-			}
-
-			case "PAGE_UP": {
-				state.cursor = Math.max(0, state.cursor - viewHeight);
+			case "PAGE_UP":
+				view.cursor = Math.max(0, view.cursor - viewHeight);
 				ensureCursorVisible(state, viewHeight);
 				render(state, lines);
 				return;
-			}
-
-			case "PAGE_DOWN": {
-				state.cursor = Math.min(lines.length - 1, state.cursor + viewHeight);
+			case "PAGE_DOWN":
+				view.cursor = Math.min(lines.length - 1, view.cursor + viewHeight);
 				ensureCursorVisible(state, viewHeight);
 				render(state, lines);
 				return;
+		}
+
+		// --- Diff view: only LEFT to close ---
+		if (state.diffView) {
+			if (name === "LEFT" || name === "h" || name === "ESCAPE") {
+				closeDiff();
 			}
+			return;
+		}
+
+		// --- Commit view: LEFT to close, RIGHT on file to open diff ---
+		if (state.commitView) {
+			switch (name) {
+				case "LEFT":
+				case "h":
+				case "ESCAPE":
+					closeCommit();
+					return;
+				case "RIGHT":
+				case "l":
+				case "ENTER": {
+					const line = lines[state.commitView.cursor];
+					if (line?.type === "change" && line.commitHash) {
+						const repo = state.repos[line.repoIndex];
+						const detail = state.commitView.lines[0]; // header has full hash in commitHash
+						if (repo) {
+							// Find the file path from the line text (strip ANSI + leading spaces)
+							const filePath = line.text.replace(/\x1b\[[0-9;]*m/g, "").trim().split("  ")[0];
+							await openCommitFileDiff(line.repoIndex, line.commitHash, filePath);
+						}
+					}
+					return;
+				}
+			}
+			return;
+		}
+
+		// --- List / detail view ---
+		switch (name) {
 
 			case "RIGHT":
 			case "l":
 			case "ENTER": {
+				const line = lines[state.cursor];
+				if (!line) return;
+
 				// On a change line — open diff
-				if (isChangeLine(lines, state.cursor)) {
-					const line = lines[state.cursor];
-					if (line.changeIndex !== undefined) {
-						await openDiff(line.repoIndex, line.changeIndex);
+				if (line.type === "change" && line.changeIndex !== undefined) {
+					const repo = state.repos[line.repoIndex];
+					if (repo) {
+						const change = repo.changes[line.changeIndex];
+						if (change) await openDiff(line.repoIndex, change.path, change.status);
 					}
 					return;
 				}
+
+				// On a commit line — open commit detail
+				if (line.type === "commit" && line.commitIndex !== undefined) {
+					await openCommit(line.repoIndex, line.commitIndex);
+					return;
+				}
+
 				// On a header line — expand or enter detail
-				if (isHeaderLine(lines, state.cursor)) {
-					const ri = repoIndexForLine(lines, state.cursor);
-					if (ri < 0) return;
-
-					if (state.detailRepo >= 0) {
-						// Already in detail, no-op on header
-						return;
-					}
-
+				if (line.type === "header") {
+					const ri = line.repoIndex;
+					if (state.detailRepo >= 0) return; // already in detail
 					if (state.expanded.has(ri)) {
-						// Already expanded — enter detail view
 						state.detailRepo = ri;
 						state.cursor = 0;
 						state.scroll = 0;
 					} else {
-						// Expand
 						state.expanded.add(ri);
 					}
 					fullRender();
@@ -612,6 +657,7 @@ export async function startTui(repos: RepoInfo[], onRefresh: () => Promise<RepoI
 					state.repos = refreshed;
 					state.detailRepo = -1;
 					state.diffView = null;
+					state.commitView = null;
 					if (!handleEmpty()) {
 						fullRender();
 					}
