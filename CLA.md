@@ -1,6 +1,6 @@
 # Contributor License Agreement
 
-By submitting contributions to oh-my-singularity, you agree that the project maintainer (DeprecatedLuke) may relicense the project, including your contributions, under a different license in the future.
+By submitting contributions to gitmonitor, you agree that the project maintainer (DeprecatedLuke) may relicense the project, including your contributions, under a different license in the future.
 
 You retain full ownership of your contributions and may use them however you wish.
 

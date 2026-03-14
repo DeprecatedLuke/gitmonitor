@@ -483,6 +483,16 @@ export async function startTui(repos: RepoInfo[], onRefresh: () => Promise<RepoI
 				case "ESCAPE":
 					closeDiff();
 					return;
+				case "PAGE_UP":
+					state.diffView.cursor = Math.max(0, state.diffView.cursor - viewHeight);
+					ensureCursorVisible(state, viewHeight);
+					render(state, lines);
+					return;
+				case "PAGE_DOWN":
+					state.diffView.cursor = Math.min(state.diffView.lines.length - 1, state.diffView.cursor + viewHeight);
+					ensureCursorVisible(state, viewHeight);
+					render(state, lines);
+					return;
 				default:
 					return;
 			}
@@ -515,6 +525,20 @@ export async function startTui(repos: RepoInfo[], onRefresh: () => Promise<RepoI
 					ensureCursorVisible(state, viewHeight);
 					render(state, lines);
 				}
+				return;
+			}
+
+			case "PAGE_UP": {
+				state.cursor = Math.max(0, state.cursor - viewHeight);
+				ensureCursorVisible(state, viewHeight);
+				render(state, lines);
+				return;
+			}
+
+			case "PAGE_DOWN": {
+				state.cursor = Math.min(lines.length - 1, state.cursor + viewHeight);
+				ensureCursorVisible(state, viewHeight);
+				render(state, lines);
 				return;
 			}
 
