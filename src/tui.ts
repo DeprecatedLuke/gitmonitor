@@ -343,20 +343,6 @@ function render(state: ViewState, lines: Line[]): void {
 
 	// Status bar takes 1 line at the bottom
 	const viewHeight = h - 1;
-	const totalLines = lines.length;
-	const needsScrollbar = totalLines > viewHeight;
-	const contentWidth = needsScrollbar ? w - 1 : w;
-
-	// Scrollbar thumb position and size
-	let thumbStart = 0;
-	let thumbEnd = 0;
-	if (needsScrollbar) {
-		const thumbSize = Math.max(1, Math.round((viewHeight / totalLines) * viewHeight));
-		const maxScroll = totalLines - viewHeight;
-		const scrollRatio = maxScroll > 0 ? scroll / maxScroll : 0;
-		thumbStart = Math.round(scrollRatio * (viewHeight - thumbSize));
-		thumbEnd = thumbStart + thumbSize;
-	}
 
 	for (let row = 0; row < viewHeight; row++) {
 		const lineIndex = scroll + row;
@@ -364,29 +350,21 @@ function render(state: ViewState, lines: Line[]): void {
 		term.styleReset();
 		term.eraseLine();
 
-		if (lineIndex < totalLines) {
-			const line = lines[lineIndex];
-			const isCursor = lineIndex === cursor;
+		if (lineIndex >= lines.length) continue;
 
-			let content = line.text;
-			if (visibleLength(content) > contentWidth) {
-				content = `${truncateAnsi(content, contentWidth - 1)}\u2026`;
-			}
+		const line = lines[lineIndex];
+		const isCursor = lineIndex === cursor;
 
-			if (isCursor) {
-				term(INVERSE + content + RESET);
-			} else {
-				term(content);
-			}
+		let content = line.text;
+		// Truncate to terminal width
+		if (visibleLength(content) > w) {
+			content = `${truncateAnsi(content, w - 1)}…`;
 		}
 
-		if (needsScrollbar) {
-			term.moveTo(w, row + 1);
-			if (row >= thumbStart && row < thumbEnd) {
-				term(`${DIM}\u2588${RESET}`);
-			} else {
-				term(`${DIM}\u2502${RESET}`);
-			}
+		if (isCursor) {
+			term(INVERSE + content + RESET);
+		} else {
+			term(content);
 		}
 	}
 
@@ -395,7 +373,7 @@ function render(state: ViewState, lines: Line[]): void {
 	term.styleReset();
 	term.eraseLine();
 	const repoCount = state.repos.length;
-	const lineInfo = `${cursor + 1}/${totalLines}`;
+	const lineInfo = `${cursor + 1}/${lines.length}`;
 	const mode = getMode(state);
 	const statusText = ` ${INVERSE} gitmonitor ${RESET} ${DIM}${repoCount} repo${repoCount === 1 ? "" : "s"} | ${mode} | ${lineInfo} | q:quit r:refresh${RESET}`;
 	if (visibleLength(statusText) > w) {
