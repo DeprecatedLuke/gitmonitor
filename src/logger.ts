@@ -27,7 +27,7 @@ function emit(level: Level, message: string, context?: Record<string, unknown>):
 			entry[k] = v;
 		}
 	}
-	process.stderr.write(JSON.stringify(entry) + "\n");
+	process.stderr.write(`${JSON.stringify(entry)}\n`);
 }
 
 export function error(message: string, context?: Record<string, unknown>): void {

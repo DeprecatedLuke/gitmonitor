@@ -33,8 +33,7 @@
 		}
 	},
 	"files": {
-		"includes": ["src/**/*.ts", "src/**/*.tsx", "test/**/*.ts", "scripts/**/*.ts", "*.ts"],
-		"ignore": ["node_modules", "dist", "vendor"]
+		"includes": ["src/**/*.ts", "src/**/*.tsx", "test/**/*.ts", "scripts/**/*.ts", "*.ts"]
 	},
 	"assist": { "actions": { "source": { "organizeImports": "on" } } }
 }

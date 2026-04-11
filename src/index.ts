@@ -1,7 +1,7 @@
 #!/usr/bin/env bun
 import * as path from "node:path";
-import * as logger from "./logger";
 import { scanAll } from "./git";
+import * as logger from "./logger";
 import { startTui } from "./tui";
 
 const rootDir = path.resolve(process.argv[2] ?? ".");

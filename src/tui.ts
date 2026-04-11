@@ -1,6 +1,6 @@
 import terminalKit from "terminal-kit";
 import type { RepoInfo } from "./git";
-import { getFileDiff, getCommitDetail, getCommitFileDiff } from "./git";
+import { getCommitDetail, getCommitFileDiff, getFileDiff } from "./git";
 import * as logger from "./logger";
 
 const term = terminalKit.terminal;
@@ -233,12 +233,27 @@ function buildDiffLines(repoIndex: number, filePath: string, diffText: string): 
 
 function buildCommitDetailLines(
 	repoIndex: number,
-	detail: { hash: string; subject: string; body: string; author: string; date: string; files: { path: string; added: number; deleted: number; status: string }[] },
+	detail: {
+		hash: string;
+		subject: string;
+		body: string;
+		author: string;
+		date: string;
+		files: { path: string; added: number; deleted: number; status: string }[];
+	},
 ): Line[] {
 	const lines: Line[] = [];
-	lines.push({ type: "header", repoIndex, text: ` ${BOLD}${YELLOW}${detail.hash.slice(0, 7)}${RESET} ${detail.subject}` });
+	lines.push({
+		type: "header",
+		repoIndex,
+		text: ` ${BOLD}${YELLOW}${detail.hash.slice(0, 7)}${RESET} ${detail.subject}`,
+	});
 	lines.push({ type: "empty", repoIndex, text: "" });
-	lines.push({ type: "message", repoIndex, text: ` ${MAGENTA}${detail.author}${RESET}  ${DIM}${detail.date}${RESET}` });
+	lines.push({
+		type: "message",
+		repoIndex,
+		text: ` ${MAGENTA}${detail.author}${RESET}  ${DIM}${detail.date}${RESET}`,
+	});
 	if (detail.body) {
 		lines.push({ type: "empty", repoIndex, text: "" });
 		for (const bodyLine of detail.body.split("\n")) {
@@ -343,7 +358,7 @@ function render(state: ViewState, lines: Line[]): void {
 		let content = line.text;
 		// Truncate to terminal width
 		if (visibleLength(content) > w) {
-			content = truncateAnsi(content, w - 1) + "…";
+			content = `${truncateAnsi(content, w - 1)}…`;
 		}
 
 		if (isCursor) {
@@ -385,7 +400,6 @@ function repoIndexForLine(lines: Line[], lineIndex: number): number {
 	if (lineIndex < 0 || lineIndex >= lines.length) return -1;
 	return lines[lineIndex].repoIndex;
 }
-
 
 // --- Main entry point ---
 
@@ -500,7 +514,7 @@ export async function startTui(repos: RepoInfo[], onRefresh: () => Promise<RepoI
 	// Setup terminal
 	term.fullscreen(true);
 	term.hideCursor();
-	term.grabInput({ mouse: false });
+	term.grabInput({ mouse: false as never });
 
 	if (!handleEmpty()) {
 		fullRender();
@@ -568,10 +582,12 @@ export async function startTui(repos: RepoInfo[], onRefresh: () => Promise<RepoI
 					const line = lines[state.commitView.cursor];
 					if (line?.type === "change" && line.commitHash) {
 						const repo = state.repos[line.repoIndex];
-						const detail = state.commitView.lines[0]; // header has full hash in commitHash
 						if (repo) {
 							// Find the file path from the line text (strip ANSI + leading spaces)
-							const filePath = line.text.replace(/\x1b\[[0-9;]*m/g, "").trim().split("  ")[0];
+							const filePath = line.text
+								.replace(/\x1b\[[0-9;]*m/g, "")
+								.trim()
+								.split("  ")[0];
 							await openCommitFileDiff(line.repoIndex, line.commitHash, filePath);
 						}
 					}
@@ -583,7 +599,6 @@ export async function startTui(repos: RepoInfo[], onRefresh: () => Promise<RepoI
 
 		// --- List / detail view ---
 		switch (name) {
-
 			case "RIGHT":
 			case "l":
 			case "ENTER": {

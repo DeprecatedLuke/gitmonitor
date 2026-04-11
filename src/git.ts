@@ -1,6 +1,6 @@
-import { $ } from "bun";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { $ } from "bun";
 import * as logger from "./logger";
 
 // ── Data model ──────────────────────────────────────────────────────────────────
@@ -74,7 +74,7 @@ export async function discoverRepos(rootDir: string): Promise<string[]> {
 		}
 
 		// Continue recursing into subdirs to find nested repos
-		await Promise.all(subdirs.map((sub) => walk(sub, depth + 1)));
+		await Promise.all(subdirs.map(sub => walk(sub, depth + 1)));
 	}
 
 	await walk(root, 0);
@@ -103,17 +103,32 @@ async function getBranch(repoPath: string): Promise<string> {
 	return branch;
 }
 
-async function getCommits(repoPath: string, count: number): Promise<Commit[]> {
-	const result = await $`git log --format=%h%x00%s%x00%ar%x00%an -n ${count}`.cwd(repoPath).quiet().nothrow();
+const MIN_COMMITS = 3;
+const RECENT_WINDOW_MS = 24 * 60 * 60 * 1000;
+const FETCH_LIMIT = 50;
+
+/** Fetch commits: all within last 24h, but at least 3. */
+async function getCommits(repoPath: string): Promise<Commit[]> {
+	const result = await $`git log --format=%h%x00%s%x00%ar%x00%an%x00%at -n ${FETCH_LIMIT}`
+		.cwd(repoPath)
+		.quiet()
+		.nothrow();
 	if (result.exitCode !== 0) return [];
 
 	const raw = result.text().trim();
 	if (!raw) return [];
 
-	return raw.split("\n").map((line) => {
-		const [hash, subject, date, author] = line.split("\0");
-		return { hash, subject, date, author };
-	});
+	const cutoff = Date.now() - RECENT_WINDOW_MS;
+	const commits: Commit[] = [];
+
+	for (const line of raw.split("\n")) {
+		const [hash, subject, date, author, epochStr] = line.split("\0");
+		const epoch = parseInt(epochStr, 10) * 1000;
+		if (commits.length >= MIN_COMMITS && epoch < cutoff) break;
+		commits.push({ hash, subject, date, author });
+	}
+
+	return commits;
 }
 
 /** Parse `git diff --numstat` output into a map of path → { added, deleted }. */
@@ -194,20 +209,11 @@ async function getChanges(repoPath: string): Promise<FileChange[]> {
 	return changes;
 }
 
-
-export async function getRepoInfo(
-	repoPath: string,
-	rootDir: string,
-	commitCount: number = 3,
-): Promise<RepoInfo> {
+export async function getRepoInfo(repoPath: string, rootDir: string): Promise<RepoInfo> {
 	const absRepo = path.resolve(repoPath);
 	const absRoot = path.resolve(rootDir);
 
-	const [branch, commits, changes] = await Promise.all([
-		getBranch(absRepo),
-		getCommits(absRepo, commitCount),
-		getChanges(absRepo),
-	]);
+	const [branch, commits, changes] = await Promise.all([getBranch(absRepo), getCommits(absRepo), getChanges(absRepo)]);
 
 	const rel = path.relative(absRoot, absRepo);
 
@@ -222,14 +228,13 @@ export async function getRepoInfo(
 
 // ── Scan all ────────────────────────────────────────────────────────────────────
 
-export async function scanAll(rootDir: string, commitCount?: number): Promise<RepoInfo[]> {
+export async function scanAll(rootDir: string): Promise<RepoInfo[]> {
 	const root = path.resolve(rootDir);
 	const repoPaths = await discoverRepos(root);
-	const infos = await Promise.all(repoPaths.map((rp) => getRepoInfo(rp, root, commitCount)));
+	const infos = await Promise.all(repoPaths.map(rp => getRepoInfo(rp, root)));
 	infos.sort((a, b) => a.relativePath.localeCompare(b.relativePath));
 	return infos;
 }
-
 
 // ── File diff ────────────────────────────────────────────────────────────────────
 
