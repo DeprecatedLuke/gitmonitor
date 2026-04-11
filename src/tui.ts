@@ -514,17 +514,107 @@ export async function startTui(repos: RepoInfo[], onRefresh: () => Promise<RepoI
 	// Setup terminal
 	term.fullscreen(true);
 	term.hideCursor();
-	term.grabInput({ mouse: false as never });
+	term.grabInput({ mouse: "button" });
 
 	if (!handleEmpty()) {
 		fullRender();
 	}
 
+	// --- Shared action helpers ---
+
+	async function handleForward(): Promise<void> {
+		if (state.diffView) return;
+
+		if (state.commitView) {
+			const line = lines[state.commitView.cursor];
+			if (line?.type === "change" && line.commitHash) {
+				const repo = state.repos[line.repoIndex];
+				if (repo) {
+					const filePath = line.text
+						.replace(/\x1b\[[0-9;]*m/g, "")
+						.trim()
+						.split("  ")[0];
+					await openCommitFileDiff(line.repoIndex, line.commitHash, filePath);
+				}
+			}
+			return;
+		}
+
+		const line = lines[state.cursor];
+		if (!line) return;
+
+		if (line.type === "change" && line.changeIndex !== undefined) {
+			const repo = state.repos[line.repoIndex];
+			if (repo) {
+				const change = repo.changes[line.changeIndex];
+				if (change) await openDiff(line.repoIndex, change.path, change.status);
+			}
+			return;
+		}
+
+		if (line.type === "commit" && line.commitIndex !== undefined) {
+			await openCommit(line.repoIndex, line.commitIndex);
+			return;
+		}
+
+		if (line.type === "header") {
+			const ri = line.repoIndex;
+			if (state.detailRepo >= 0) return;
+			if (state.expanded.has(ri)) {
+				state.detailRepo = ri;
+				state.cursor = 0;
+				state.scroll = 0;
+			} else {
+				state.expanded.add(ri);
+			}
+			fullRender();
+		}
+	}
+
+	function handleBack(): void {
+		if (state.diffView) {
+			closeDiff();
+			return;
+		}
+
+		if (state.commitView) {
+			closeCommit();
+			return;
+		}
+
+		const viewHeight = term.height - 1;
+
+		if (state.detailRepo >= 0) {
+			const prevRepo = state.detailRepo;
+			state.detailRepo = -1;
+			state.cursor = 0;
+			state.scroll = 0;
+			fullRender();
+			for (let li = 0; li < lines.length; li++) {
+				if (lines[li].type === "header" && lines[li].repoIndex === prevRepo) {
+					state.cursor = li;
+					ensureCursorVisible(state, viewHeight);
+					render(state, lines);
+					break;
+				}
+			}
+			return;
+		}
+
+		const ri = repoIndexForLine(lines, state.cursor);
+		if (ri >= 0 && state.expanded.has(ri)) {
+			state.expanded.delete(ri);
+			fullRender();
+		}
+	}
+
+	// --- Keyboard input ---
+
 	term.on("key", async (name: string) => {
 		const viewHeight = term.height - 1;
 		const view = activeView(state);
 
-		// --- Universal keys ---
+		// Universal keys
 		switch (name) {
 			case "q":
 			case "CTRL_C":
@@ -560,112 +650,18 @@ export async function startTui(repos: RepoInfo[], onRefresh: () => Promise<RepoI
 				return;
 		}
 
-		// --- Diff view: only LEFT to close ---
-		if (state.diffView) {
-			if (name === "LEFT" || name === "h" || name === "ESCAPE") {
-				closeDiff();
-			}
-			return;
-		}
-
-		// --- Commit view: LEFT to close, RIGHT on file to open diff ---
-		if (state.commitView) {
-			switch (name) {
-				case "LEFT":
-				case "h":
-				case "ESCAPE":
-					closeCommit();
-					return;
-				case "RIGHT":
-				case "l":
-				case "ENTER": {
-					const line = lines[state.commitView.cursor];
-					if (line?.type === "change" && line.commitHash) {
-						const repo = state.repos[line.repoIndex];
-						if (repo) {
-							// Find the file path from the line text (strip ANSI + leading spaces)
-							const filePath = line.text
-								.replace(/\x1b\[[0-9;]*m/g, "")
-								.trim()
-								.split("  ")[0];
-							await openCommitFileDiff(line.repoIndex, line.commitHash, filePath);
-						}
-					}
-					return;
-				}
-			}
-			return;
-		}
-
-		// --- List / detail view ---
+		// Forward / back
 		switch (name) {
 			case "RIGHT":
 			case "l":
-			case "ENTER": {
-				const line = lines[state.cursor];
-				if (!line) return;
-
-				// On a change line — open diff
-				if (line.type === "change" && line.changeIndex !== undefined) {
-					const repo = state.repos[line.repoIndex];
-					if (repo) {
-						const change = repo.changes[line.changeIndex];
-						if (change) await openDiff(line.repoIndex, change.path, change.status);
-					}
-					return;
-				}
-
-				// On a commit line — open commit detail
-				if (line.type === "commit" && line.commitIndex !== undefined) {
-					await openCommit(line.repoIndex, line.commitIndex);
-					return;
-				}
-
-				// On a header line — expand or enter detail
-				if (line.type === "header") {
-					const ri = line.repoIndex;
-					if (state.detailRepo >= 0) return; // already in detail
-					if (state.expanded.has(ri)) {
-						state.detailRepo = ri;
-						state.cursor = 0;
-						state.scroll = 0;
-					} else {
-						state.expanded.add(ri);
-					}
-					fullRender();
-				}
+			case "ENTER":
+				await handleForward();
 				return;
-			}
-
 			case "LEFT":
 			case "h":
-			case "ESCAPE": {
-				if (state.detailRepo >= 0) {
-					const prevRepo = state.detailRepo;
-					state.detailRepo = -1;
-					state.cursor = 0;
-					state.scroll = 0;
-					fullRender();
-					// Restore cursor to the header of the repo we were viewing
-					for (let li = 0; li < lines.length; li++) {
-						if (lines[li].type === "header" && lines[li].repoIndex === prevRepo) {
-							state.cursor = li;
-							ensureCursorVisible(state, viewHeight);
-							render(state, lines);
-							break;
-						}
-					}
-					return;
-				}
-				// In list view — collapse current repo if on its lines
-				const ri = repoIndexForLine(lines, state.cursor);
-				if (ri >= 0 && state.expanded.has(ri)) {
-					state.expanded.delete(ri);
-					fullRender();
-				}
+			case "ESCAPE":
+				handleBack();
 				return;
-			}
-
 			case "r": {
 				try {
 					const refreshed = await onRefresh();
@@ -681,8 +677,41 @@ export async function startTui(repos: RepoInfo[], onRefresh: () => Promise<RepoI
 				}
 				return;
 			}
-
 			default:
+				return;
+		}
+	});
+
+	// --- Mouse input ---
+
+	const SCROLL_LINES = 3;
+
+	term.on("mouse", async (name: string, data: { x: number; y: number }) => {
+		const viewHeight = term.height - 1;
+		const view = activeView(state);
+
+		switch (name) {
+			case "MOUSE_WHEEL_UP":
+				view.cursor = Math.max(0, view.cursor - SCROLL_LINES);
+				ensureCursorVisible(state, viewHeight);
+				render(state, lines);
+				return;
+			case "MOUSE_WHEEL_DOWN":
+				view.cursor = Math.min(lines.length - 1, view.cursor + SCROLL_LINES);
+				ensureCursorVisible(state, viewHeight);
+				render(state, lines);
+				return;
+			case "MOUSE_LEFT_BUTTON_PRESSED": {
+				// Map screen row to line index
+				const lineIndex = view.scroll + (data.y - 1);
+				if (lineIndex < 0 || lineIndex >= lines.length) return;
+				view.cursor = lineIndex;
+				render(state, lines);
+				await handleForward();
+				return;
+			}
+			case "MOUSE_RIGHT_BUTTON_PRESSED":
+				handleBack();
 				return;
 		}
 	});
