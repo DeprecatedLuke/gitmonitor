@@ -28,7 +28,7 @@ export type CommitEntry = {
 	author: string;
 	/** Committer time, seconds since epoch (UTC) */
 	epoch: number;
-	/** Relative time string, e.g. "3m ago", "2d ago" */
+	/** Compact relative time string, e.g. "3m", "2d4h" */
 	dateRelative: string;
 };
 
@@ -58,7 +58,6 @@ type RepoCacheEntry = {
 };
 
 type BlobSide = {
-	exists: boolean;
 	blob: Uint8Array | null;
 };
 
@@ -67,10 +66,16 @@ type LineChange = {
 	deleted: number;
 };
 
-type DiffOp = {
-	kind: "equal" | "add" | "delete";
-	line: string;
-};
+export type DiffLine =
+	| { kind: "equal"; line: string }
+	| { kind: "add"; line: string }
+	| { kind: "delete"; line: string };
+
+export type FileDiff =
+	| { kind: "ops"; ops: DiffLine[]; oldLineCount: number; newLineCount: number }
+	| { kind: "binary" }
+	| { kind: "oversized" }
+	| { kind: "unavailable"; message: string };
 
 const SKIP_DIRS = new Set(["node_modules", ".bun-install", ".git"]);
 const MAX_DEPTH = 10;
@@ -125,20 +130,20 @@ export async function scanAll(rootDir: string, opts: ScanOptions): Promise<ScanR
 	return { commits, repoCount: repoPaths.length };
 }
 
-/** Unified diff text for a single file in a commit, vs. its first parent (or /dev/null for root). */
-export async function getCommitFileDiff(repoPath: string, hash: string, filePath: string): Promise<string> {
+/** Structured diff for a single file in a commit, vs. its first parent (or /dev/null for root). */
+export async function getCommitFileDiff(repoPath: string, hash: string, filePath: string): Promise<FileDiff> {
 	const dir = path.resolve(repoPath);
 	const commit = await git.readCommit({ fs: nodeFs, dir, oid: hash });
 	const parentHash = commit.commit.parent[0] ?? null;
-	const diffUnavailable = (err: unknown): string => {
+	const diffUnavailable = (err: unknown): FileDiff => {
 		logger.debug("diff read failed", { repo: repoPath, hash, path: filePath, error: String(err) });
 		const message = err instanceof Error && err.message !== "" ? err.message : String(err);
-		return `(diff unavailable: ${message})`;
+		return { kind: "unavailable", message };
 	};
 
 	let oldSide: BlobSide;
 	try {
-		oldSide = parentHash === null ? { exists: false, blob: null } : await readBlobSide(dir, parentHash, filePath);
+		oldSide = parentHash === null ? { blob: null } : await readBlobSide(dir, parentHash, filePath);
 	} catch (err) {
 		return diffUnavailable(err);
 	}
@@ -151,17 +156,22 @@ export async function getCommitFileDiff(repoPath: string, hash: string, filePath
 	}
 
 	if ((oldSide.blob !== null && isBinaryBlob(oldSide.blob)) || (newSide.blob !== null && isBinaryBlob(newSide.blob))) {
-		return "Binary file differs";
+		return { kind: "binary" };
 	}
 
 	const oldLines = oldSide.blob === null ? [] : splitLines(decodeBlob(oldSide.blob));
 	const newLines = newSide.blob === null ? [] : splitLines(decodeBlob(newSide.blob));
 
 	if (oldLines.length > MAX_DIFF_LINES && newLines.length > MAX_DIFF_LINES) {
-		return "(diff too large)";
+		return { kind: "oversized" };
 	}
 
-	return buildUnifiedDiff(filePath, oldSide.exists, newSide.exists, oldLines, newLines);
+	return {
+		kind: "ops",
+		ops: buildDiffOps(oldLines, newLines),
+		oldLineCount: oldLines.length,
+		newLineCount: newLines.length,
+	};
 }
 
 /** Lazy, memoized per (repoPath, hash). Returns [] on object-store failures. */
@@ -528,7 +538,7 @@ function lcsLengths(a: string[], b: string[]): Uint32Array {
 	return previous;
 }
 
-function buildDiffOps(oldLines: string[], newLines: string[]): DiffOp[] {
+function buildDiffOps(oldLines: string[], newLines: string[]): DiffLine[] {
 	if (oldLines.length === 0) return newLines.map(line => ({ kind: "add" as const, line }));
 	if (newLines.length === 0) return oldLines.map(line => ({ kind: "delete" as const, line }));
 
@@ -584,39 +594,13 @@ function buildDiffOps(oldLines: string[], newLines: string[]): DiffOp[] {
 	];
 }
 
-function buildUnifiedDiff(
-	filePath: string,
-	oldExists: boolean,
-	newExists: boolean,
-	oldLines: string[],
-	newLines: string[],
-): string {
-	const oldHeader = oldExists ? `a/${filePath}` : "/dev/null";
-	const newHeader = newExists ? `b/${filePath}` : "/dev/null";
-	const oldStart = oldLines.length === 0 ? 0 : 1;
-	const newStart = newLines.length === 0 ? 0 : 1;
-	const lines = [
-		`--- ${oldHeader}`,
-		`+++ ${newHeader}`,
-		`@@ -${oldStart},${oldLines.length} +${newStart},${newLines.length} @@`,
-	];
-
-	for (const op of buildDiffOps(oldLines, newLines)) {
-		if (op.kind === "equal") lines.push(` ${op.line}`);
-		if (op.kind === "add") lines.push(`+${op.line}`);
-		if (op.kind === "delete") lines.push(`-${op.line}`);
-	}
-
-	return lines.join("\n");
-}
-
 async function readBlobSide(repoPath: string, hash: string, filePath: string): Promise<BlobSide> {
 	try {
 		const result = await git.readBlob({ fs: nodeFs, dir: repoPath, oid: hash, filepath: filePath });
-		return { exists: true, blob: result.blob };
+		return { blob: result.blob };
 	} catch (err) {
 		if (isNotFoundError(err)) {
-			return { exists: false, blob: null };
+			return { blob: null };
 		}
 		throw err;
 	}
@@ -642,15 +626,43 @@ function decodeBlob(blob: Uint8Array): string {
 }
 
 function formatRelative(epoch: number): string {
-	const seconds = Math.floor(Date.now() / 1000 - epoch);
-	if (seconds < 0) return "just now";
-	if (seconds < SECONDS_PER_MINUTE) return `${seconds}s ago`;
-	if (seconds < SECONDS_PER_HOUR) return `${Math.floor(seconds / SECONDS_PER_MINUTE)}m ago`;
-	if (seconds < SECONDS_PER_DAY) return `${Math.floor(seconds / SECONDS_PER_HOUR)}h ago`;
-	if (seconds < SECONDS_PER_WEEK) return `${Math.floor(seconds / SECONDS_PER_DAY)}d ago`;
-	if (seconds < SECONDS_PER_MONTH) return `${Math.floor(seconds / SECONDS_PER_WEEK)}w ago`;
-	if (seconds < SECONDS_PER_YEAR) return `${Math.floor(seconds / SECONDS_PER_MONTH)}mo ago`;
-	return `${Math.floor(seconds / SECONDS_PER_YEAR)}y ago`;
+	const elapsed = Math.floor(Date.now() / 1000 - epoch);
+	if (elapsed < 1) return "0s";
+
+	let remaining = elapsed;
+	const years = Math.floor(remaining / SECONDS_PER_YEAR);
+	remaining %= SECONDS_PER_YEAR;
+	const months = Math.floor(remaining / SECONDS_PER_MONTH);
+	remaining %= SECONDS_PER_MONTH;
+	const weeks = Math.floor(remaining / SECONDS_PER_WEEK);
+	remaining %= SECONDS_PER_WEEK;
+	const days = Math.floor(remaining / SECONDS_PER_DAY);
+	remaining %= SECONDS_PER_DAY;
+	const hours = Math.floor(remaining / SECONDS_PER_HOUR);
+	remaining %= SECONDS_PER_HOUR;
+	const minutes = Math.floor(remaining / SECONDS_PER_MINUTE);
+	const seconds = remaining % SECONDS_PER_MINUTE;
+
+	const units = [
+		{ value: years, suffix: "y" },
+		{ value: months, suffix: "mo" },
+		{ value: weeks, suffix: "w" },
+		{ value: days, suffix: "d" },
+		{ value: hours, suffix: "h" },
+		{ value: minutes, suffix: "m" },
+		{ value: seconds, suffix: "s" },
+	];
+
+	for (const [index, unit] of units.entries()) {
+		if (unit.value === 0) continue;
+
+		const secondary = units[index + 1];
+		const secondaryPart =
+			secondary !== undefined && secondary.value > 0 ? `${secondary.value}${secondary.suffix}` : "";
+		return `${unit.value}${unit.suffix}${secondaryPart}`;
+	}
+
+	return "0s";
 }
 
 function hydrateCommit(rootDir: string, commit: CachedCommitEntry): CommitEntry {

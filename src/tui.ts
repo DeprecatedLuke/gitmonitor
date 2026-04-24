@@ -1,6 +1,6 @@
 import terminalKit from "terminal-kit";
 import * as logger from "./logger";
-import type { CommitEntry, FileDiffStat, ScanResult } from "./scanner";
+import type { CommitEntry, DiffLine, FileDiff, FileDiffStat, ScanResult } from "./scanner";
 import { getCommitFileDiff, getCommitFiles } from "./scanner";
 
 const term = terminalKit.terminal;
@@ -19,8 +19,9 @@ const RESET = "\x1b[0m";
 const EMPTY_MESSAGE = "No git repositories with commits found";
 const SCROLL_LINES = 3;
 const REFRESH_MS = 5000;
-const IDENTITY_SEPARATOR = "\u0000";
-
+const HUNK_CONTEXT = 3;
+const PREFIX_WIDTH = 32;
+const TIME_WIDTH = 6;
 // --- Line model ---
 
 type Line =
@@ -29,6 +30,8 @@ type Line =
 	| { kind: "diff"; commitIndex: number; fileIndex: number; text: string }
 	| { kind: "empty"; text: string }
 	| { kind: "message"; text: string };
+
+type FileExpansionMode = "hunks" | "full";
 
 type ViewState = {
 	scan: ScanResult;
@@ -40,10 +43,10 @@ type ViewState = {
 	filesCache: Map<string, FileDiffStat[]>;
 	/** commit hashes whose file list is loading */
 	filesLoading: Set<string>;
-	/** "<commitIndex>:<fileIndex>" whose diff is shown */
-	expandedFiles: Set<string>;
-	/** Cache of diff text by the same "<commitIndex>:<fileIndex>" key */
-	diffCache: Map<string, string>;
+	/** "<commitHash>:<filePath>" expanded rendering mode */
+	expandedFiles: Map<string, FileExpansionMode>;
+	/** Cache of structured file diffs by the same "<commitHash>:<filePath>" key */
+	diffCache: Map<string, FileDiff>;
 };
 
 type LineContext = {
@@ -89,24 +92,15 @@ function truncateRow(s: string, width: number): string {
 
 // --- Line building ---
 
-function fileKey(commitIndex: number, fileIndex: number): string {
-	return `${commitIndex}:${fileIndex}`;
+function fileKey(commitHash: string, filePath: string): string {
+	return `${commitHash}:${filePath}`;
 }
 
-function parseFileKey(key: string): { commitIndex: number; fileIndex: number } | null {
+function parseFileKey(key: string): { hash: string; path: string } | null {
 	const separator = key.indexOf(":");
 	if (separator < 1 || separator === key.length - 1) return null;
 
-	const commitIndex = Number.parseInt(key.slice(0, separator), 10);
-	const fileIndex = Number.parseInt(key.slice(separator + 1), 10);
-	if (!Number.isInteger(commitIndex) || !Number.isInteger(fileIndex)) return null;
-	if (commitIndex < 0 || fileIndex < 0) return null;
-
-	return { commitIndex, fileIndex };
-}
-
-function identityKey(hash: string, path: string): string {
-	return `${hash}${IDENTITY_SEPARATOR}${path}`;
+	return { hash: key.slice(0, separator), path: key.slice(separator + 1) };
 }
 
 function centerDimMessage(text: string, width: number): string {
@@ -125,7 +119,15 @@ function colorDiffLine(raw: string): string {
 
 function formatCommitLine(commit: CommitEntry, expanded: boolean): string {
 	const arrow = expanded ? "▼" : "▶";
-	return ` ${arrow} ${BOLD}${commit.repoLabel}${RESET}/${YELLOW}${commit.shortHash}${RESET}${DIM} - ${RESET}${commit.subject}`;
+	const coloredPrefix = `${BOLD}${commit.repoLabel}${RESET}/${YELLOW}${commit.shortHash}${RESET}`;
+	const prefixLength = visibleLength(coloredPrefix);
+	const paddedPrefix =
+		prefixLength > PREFIX_WIDTH
+			? `${truncateAnsi(coloredPrefix, PREFIX_WIDTH - 1)}…`
+			: `${coloredPrefix}${" ".repeat(PREFIX_WIDTH - prefixLength)}`;
+	const paddedTime = commit.dateRelative.padStart(TIME_WIDTH, " ");
+
+	return ` ${arrow} ${DIM}${paddedTime}${RESET}  ${paddedPrefix}  ${commit.subject}`;
 }
 
 function formatFileLine(file: FileDiffStat, expanded: boolean): string {
@@ -135,6 +137,142 @@ function formatFileLine(file: FileDiffStat, expanded: boolean): string {
 	if (file.deleted > 0) parts.push(`${RED}-${file.deleted}${RESET}`);
 	const stats = parts.length > 0 ? ` ${parts.join(" ")}` : "";
 	return `    ${arrow} ${file.path}${stats}`;
+}
+
+type DiffRenderLine = { kind: "diff"; text: string } | { kind: "message"; text: string };
+
+type HunkRange = {
+	start: number;
+	end: number;
+};
+
+function diffMessage(text: string): DiffRenderLine {
+	return { kind: "message", text: `      ${DIM}${text}${RESET}` };
+}
+
+function diffContent(raw: string): DiffRenderLine {
+	return { kind: "diff", text: `      ${colorDiffLine(raw)}` };
+}
+
+function unreachable(value: unknown): never {
+	throw new Error(`Unhandled variant: ${JSON.stringify(value)}`);
+}
+
+function prefixedDiffLine(op: DiffLine): string {
+	switch (op.kind) {
+		case "equal":
+			return ` ${op.line}`;
+		case "add":
+			return `+${op.line}`;
+		case "delete":
+			return `-${op.line}`;
+	}
+
+	return unreachable(op);
+}
+
+function hunkRanges(ops: DiffLine[]): HunkRange[] {
+	const ranges: HunkRange[] = [];
+
+	for (let index = 0; index < ops.length; index++) {
+		if (ops[index].kind === "equal") continue;
+
+		const start = Math.max(0, index - HUNK_CONTEXT);
+		const end = Math.min(ops.length - 1, index + HUNK_CONTEXT);
+		const last = ranges.at(-1);
+
+		if (last && start <= last.end + 1) {
+			last.end = Math.max(last.end, end);
+			continue;
+		}
+
+		ranges.push({ start, end });
+	}
+
+	return ranges;
+}
+
+function advanceLineNumbers(op: DiffLine, oldLine: number, newLine: number): { oldLine: number; newLine: number } {
+	switch (op.kind) {
+		case "equal":
+			return { oldLine: oldLine + 1, newLine: newLine + 1 };
+		case "add":
+			return { oldLine, newLine: newLine + 1 };
+		case "delete":
+			return { oldLine: oldLine + 1, newLine };
+	}
+
+	return unreachable(op);
+}
+
+function hunkHeader(ops: DiffLine[], range: HunkRange): string {
+	let oldLine = 1;
+	let newLine = 1;
+
+	for (let index = 0; index < range.start; index++) {
+		const next = advanceLineNumbers(ops[index], oldLine, newLine);
+		oldLine = next.oldLine;
+		newLine = next.newLine;
+	}
+
+	let oldStart: number | undefined;
+	let newStart: number | undefined;
+	let oldLength = 0;
+	let newLength = 0;
+
+	for (let index = range.start; index <= range.end; index++) {
+		const op = ops[index];
+		if (op.kind !== "add") {
+			oldStart ??= oldLine;
+			oldLength++;
+		}
+		if (op.kind !== "delete") {
+			newStart ??= newLine;
+			newLength++;
+		}
+
+		const next = advanceLineNumbers(op, oldLine, newLine);
+		oldLine = next.oldLine;
+		newLine = next.newLine;
+	}
+
+	return `@@ -${oldLength === 0 ? 0 : (oldStart ?? 1)},${oldLength} +${newLength === 0 ? 0 : (newStart ?? 1)},${newLength} @@`;
+}
+
+function renderFullDiff(ops: DiffLine[]): DiffRenderLine[] {
+	if (ops.length === 0) return [diffMessage("(no textual changes)")];
+
+	return ops.map(op => diffContent(prefixedDiffLine(op)));
+}
+
+function renderHunkDiff(ops: DiffLine[]): DiffRenderLine[] {
+	const ranges = hunkRanges(ops);
+	if (ranges.length === 0) return [diffMessage("(no textual changes)")];
+
+	const rendered: DiffRenderLine[] = [];
+	for (const range of ranges) {
+		rendered.push(diffContent(hunkHeader(ops, range)));
+		for (let index = range.start; index <= range.end; index++) {
+			rendered.push(diffContent(prefixedDiffLine(ops[index])));
+		}
+	}
+
+	return rendered;
+}
+
+function renderFileDiff(diff: FileDiff, mode: FileExpansionMode): DiffRenderLine[] {
+	switch (diff.kind) {
+		case "ops":
+			return mode === "full" ? renderFullDiff(diff.ops) : renderHunkDiff(diff.ops);
+		case "binary":
+			return [diffMessage("Binary file differs")];
+		case "oversized":
+			return [diffMessage("(diff too large)")];
+		case "unavailable":
+			return [diffMessage(`(diff unavailable: ${diff.message})`)];
+	}
+
+	return unreachable(diff);
 }
 
 function buildLines(state: ViewState, width: number): Line[] {
@@ -167,30 +305,35 @@ function buildLines(state: ViewState, width: number): Line[] {
 
 		for (let fileIndex = 0; fileIndex < files.length; fileIndex++) {
 			const file = files[fileIndex];
-			const key = fileKey(commitIndex, fileIndex);
-			const fileExpanded = state.expandedFiles.has(key);
+			const key = fileKey(commit.hash, file.path);
+			const fileMode = state.expandedFiles.get(key);
 			lines.push({
 				kind: "file",
 				commitIndex,
 				fileIndex,
-				text: formatFileLine(file, fileExpanded),
+				text: formatFileLine(file, fileMode !== undefined),
 			});
 
-			if (!fileExpanded) continue;
+			if (fileMode === undefined) continue;
 
-			const diffText = state.diffCache.get(key);
-			if (diffText === undefined) {
+			const diff = state.diffCache.get(key);
+			if (diff === undefined) {
 				lines.push({ kind: "message", text: `      ${DIM}Loading diff…${RESET}` });
 				continue;
 			}
 
-			for (const raw of diffText.split("\n")) {
-				lines.push({
-					kind: "diff",
-					commitIndex,
-					fileIndex,
-					text: `      ${colorDiffLine(raw)}`,
-				});
+			for (const rendered of renderFileDiff(diff, fileMode)) {
+				if (rendered.kind === "diff") {
+					lines.push({
+						kind: "diff",
+						commitIndex,
+						fileIndex,
+						text: rendered.text,
+					});
+					continue;
+				}
+
+				lines.push({ kind: "message", text: rendered.text });
 			}
 		}
 	}
@@ -222,10 +365,134 @@ function lineContext(lines: Line[], lineIndex: number): LineContext | null {
 	return null;
 }
 
-function cursorCommitHash(state: ViewState, lines: Line[]): string | undefined {
+type CursorAnchor =
+	| { kind: "commit"; hash: string }
+	| { kind: "file"; hash: string; path: string }
+	| { kind: "diff"; hash: string; path: string; offset: number };
+
+type FileIdentity = {
+	hash: string;
+	path: string;
+	key: string;
+};
+
+function fileIdentityAt(state: ViewState, commitIndex: number, fileIndex: number): FileIdentity | null {
+	const commit = state.scan.commits[commitIndex];
+	const files = commit === undefined ? undefined : state.filesCache.get(commit.hash);
+	const file = files?.[fileIndex];
+	if (commit === undefined || file === undefined) return null;
+
+	return { hash: commit.hash, path: file.path, key: fileKey(commit.hash, file.path) };
+}
+
+function diffOffset(lines: Line[], lineIndex: number, line: Extract<Line, { kind: "diff" }>): number {
+	let offset = 0;
+
+	for (let index = lineIndex - 1; index >= 0; index--) {
+		const previous = lines[index];
+		if (
+			previous.kind === "file" &&
+			previous.commitIndex === line.commitIndex &&
+			previous.fileIndex === line.fileIndex
+		) {
+			return offset;
+		}
+		if (previous.kind === "commit" || previous.kind === "file") break;
+		if (
+			previous.kind === "diff" &&
+			previous.commitIndex === line.commitIndex &&
+			previous.fileIndex === line.fileIndex
+		) {
+			offset++;
+		}
+	}
+
+	return offset;
+}
+
+function cursorAnchor(state: ViewState, lines: Line[]): CursorAnchor | null {
+	const line = lines[state.cursor];
+	if (line === undefined) return null;
+
+	if (line.kind === "commit") {
+		const commit = state.scan.commits[line.commitIndex];
+		return commit === undefined ? null : { kind: "commit", hash: commit.hash };
+	}
+
+	if (line.kind === "file") {
+		const identity = fileIdentityAt(state, line.commitIndex, line.fileIndex);
+		return identity === null ? null : { kind: "file", hash: identity.hash, path: identity.path };
+	}
+
+	if (line.kind === "diff") {
+		const identity = fileIdentityAt(state, line.commitIndex, line.fileIndex);
+		return identity === null
+			? null
+			: { kind: "diff", hash: identity.hash, path: identity.path, offset: diffOffset(lines, state.cursor, line) };
+	}
+
 	const context = lineContext(lines, state.cursor);
-	if (!context) return undefined;
-	return state.scan.commits[context.commitIndex]?.hash;
+	const commit = context === null ? undefined : state.scan.commits[context.commitIndex];
+	return commit === undefined ? null : { kind: "commit", hash: commit.hash };
+}
+
+function lineMatchesFileAnchor(state: ViewState, line: Line, anchor: { hash: string; path: string }): boolean {
+	if (line.kind !== "file") return false;
+	const identity = fileIdentityAt(state, line.commitIndex, line.fileIndex);
+	return identity !== null && identity.hash === anchor.hash && identity.path === anchor.path;
+}
+
+function findAnchorLine(state: ViewState, lines: Line[], anchor: CursorAnchor): number | null {
+	if (anchor.kind === "commit") {
+		return lines.findIndex(line => {
+			if (line.kind !== "commit") return false;
+			return state.scan.commits[line.commitIndex]?.hash === anchor.hash;
+		});
+	}
+
+	if (anchor.kind === "file") {
+		const fileIndex = lines.findIndex(line => lineMatchesFileAnchor(state, line, anchor));
+		return fileIndex === -1 ? null : fileIndex;
+	}
+
+	for (let index = 0; index < lines.length; index++) {
+		const line = lines[index];
+		if (!lineMatchesFileAnchor(state, line, anchor)) continue;
+
+		let offset = 0;
+		for (let childIndex = index + 1; childIndex < lines.length; childIndex++) {
+			const child = lines[childIndex];
+			if (child.kind === "commit" || child.kind === "file") break;
+			if (child.kind !== "diff") continue;
+
+			const identity = fileIdentityAt(state, child.commitIndex, child.fileIndex);
+			if (identity === null || identity.hash !== anchor.hash || identity.path !== anchor.path) continue;
+			if (offset === anchor.offset) return childIndex;
+			offset++;
+		}
+
+		return null;
+	}
+
+	return null;
+}
+
+function withAnchoredRefresh(state: ViewState, currentLines: Line[], fn: () => Line[]): Line[] {
+	const anchor = cursorAnchor(state, currentLines);
+	const viewportOffset = state.cursor - state.scroll;
+	const nextLines = fn();
+	const matchedIndex = anchor === null ? null : findAnchorLine(state, nextLines, anchor);
+
+	if (matchedIndex !== null && matchedIndex >= 0) {
+		state.cursor = matchedIndex;
+		const clampedOffset = Math.max(0, Math.min(viewportOffset, viewHeight() - 1));
+		state.scroll = Math.max(0, matchedIndex - clampedOffset);
+		ensureCursorVisible(state, viewHeight(), nextLines.length);
+		return nextLines;
+	}
+
+	clampCursorAndScroll(state, nextLines);
+	return nextLines;
 }
 
 // --- Rendering ---
@@ -318,39 +585,23 @@ function collectExpandedCommitHashes(state: ViewState): Set<string> {
 	return hashes;
 }
 
-function collectExpandedFileIdentities(state: ViewState): Set<string> {
-	const identities = new Set<string>();
-	for (const key of state.expandedFiles) {
+function collectExpandedFileHashes(expandedFiles: Map<string, FileExpansionMode>): Set<string> {
+	const hashes = new Set<string>();
+	for (const key of expandedFiles.keys()) {
 		const parsed = parseFileKey(key);
-		if (!parsed) continue;
-		const commit = state.scan.commits[parsed.commitIndex];
-		const files = commit === undefined ? undefined : state.filesCache.get(commit.hash);
-		const file = files?.[parsed.fileIndex];
-		if (commit && file) identities.add(identityKey(commit.hash, file.path));
+		if (parsed !== null) hashes.add(parsed.hash);
 	}
-	return identities;
-}
-
-function collectDiffCacheByIdentity(state: ViewState): Map<string, string> {
-	const cache = new Map<string, string>();
-	for (const [key, diffText] of state.diffCache) {
-		const parsed = parseFileKey(key);
-		if (!parsed) continue;
-		const commit = state.scan.commits[parsed.commitIndex];
-		const files = commit === undefined ? undefined : state.filesCache.get(commit.hash);
-		const file = files?.[parsed.fileIndex];
-		if (commit && file) cache.set(identityKey(commit.hash, file.path), diffText);
-	}
-	return cache;
+	return hashes;
 }
 
 function remapStateForScan(state: ViewState, nextScan: ScanResult): void {
 	const expandedCommitHashes = collectExpandedCommitHashes(state);
-	const expandedFileIdentities = collectExpandedFileIdentities(state);
-	const cacheByIdentity = collectDiffCacheByIdentity(state);
+	const expandedFileHashes = collectExpandedFileHashes(state.expandedFiles);
 	const nextCommitHashes = new Set(nextScan.commits.map(commit => commit.hash));
 	const nextFilesCache = new Map<string, FileDiffStat[]>();
 	const nextFilesLoading = new Set<string>();
+	const nextExpandedFiles = new Map<string, FileExpansionMode>();
+	const nextDiffCache = new Map<string, FileDiff>();
 
 	for (const [hash, files] of state.filesCache) {
 		if (nextCommitHashes.has(hash)) nextFilesCache.set(hash, files);
@@ -358,60 +609,28 @@ function remapStateForScan(state: ViewState, nextScan: ScanResult): void {
 	for (const hash of state.filesLoading) {
 		if (nextCommitHashes.has(hash)) nextFilesLoading.add(hash);
 	}
+	for (const [key, mode] of state.expandedFiles) {
+		const parsed = parseFileKey(key);
+		if (parsed !== null && nextCommitHashes.has(parsed.hash)) nextExpandedFiles.set(key, mode);
+	}
+	for (const [key, diff] of state.diffCache) {
+		const parsed = parseFileKey(key);
+		if (parsed !== null && nextCommitHashes.has(parsed.hash)) nextDiffCache.set(key, diff);
+	}
 
 	state.scan = nextScan;
 	state.expandedCommits = new Set<number>();
 	state.filesCache = nextFilesCache;
 	state.filesLoading = nextFilesLoading;
-	state.expandedFiles = new Set<string>();
-	state.diffCache = new Map<string, string>();
+	state.expandedFiles = nextExpandedFiles;
+	state.diffCache = nextDiffCache;
 
 	for (let commitIndex = 0; commitIndex < state.scan.commits.length; commitIndex++) {
 		const commit = state.scan.commits[commitIndex];
-		if (expandedCommitHashes.has(commit.hash)) {
+		if (expandedCommitHashes.has(commit.hash) || expandedFileHashes.has(commit.hash)) {
 			state.expandedCommits.add(commitIndex);
 		}
-
-		const files = state.filesCache.get(commit.hash) ?? [];
-		for (let fileIndex = 0; fileIndex < files.length; fileIndex++) {
-			const file = files[fileIndex];
-			const identity = identityKey(commit.hash, file.path);
-			const key = fileKey(commitIndex, fileIndex);
-
-			if (expandedFileIdentities.has(identity)) {
-				state.expandedCommits.add(commitIndex);
-				state.expandedFiles.add(key);
-			}
-
-			if (cacheByIdentity.has(identity)) {
-				state.diffCache.set(key, cacheByIdentity.get(identity) ?? "");
-			}
-		}
 	}
-}
-
-function findCommitLine(lines: Line[], commitIndex: number): number {
-	return lines.findIndex(line => line.kind === "commit" && line.commitIndex === commitIndex);
-}
-
-function restoreCursorAfterRefresh(
-	state: ViewState,
-	lines: Line[],
-	hash: string | undefined,
-	fallbackCursor: number,
-): void {
-	if (hash) {
-		const commitIndex = state.scan.commits.findIndex(commit => commit.hash === hash);
-		if (commitIndex >= 0) {
-			const lineIndex = findCommitLine(lines, commitIndex);
-			if (lineIndex >= 0) {
-				state.cursor = lineIndex;
-				return;
-			}
-		}
-	}
-
-	state.cursor = fallbackCursor;
 }
 
 // --- Main entry point ---
@@ -424,13 +643,13 @@ export async function startTui(initial: ScanResult, onRefresh: () => Promise<Sca
 		cursor: 0,
 		scroll: 0,
 		expandedCommits: new Set(),
-		expandedFiles: new Set(),
+		expandedFiles: new Map(),
 		diffCache: new Map(),
 		filesCache: new Map(),
 		filesLoading: new Set(),
 	};
 
-	const loadingDiffs = new Set<string>();
+	const diffLoading = new Set<string>();
 	let lines = buildLines(state, term.width);
 	let refreshTimer: NodeJS.Timeout | undefined;
 	let refreshing = false;
@@ -479,55 +698,60 @@ export async function startTui(initial: ScanResult, onRefresh: () => Promise<Sca
 	}
 
 	function collapseCommit(commitIndex: number): void {
+		const commit = state.scan.commits[commitIndex];
+		if (commit === undefined) return;
+
 		state.expandedCommits.delete(commitIndex);
-		for (const key of [...state.expandedFiles]) {
+		for (const key of [...state.expandedFiles.keys()]) {
 			const parsed = parseFileKey(key);
-			if (parsed?.commitIndex === commitIndex) state.expandedFiles.delete(key);
+			if (parsed?.hash === commit.hash) state.expandedFiles.delete(key);
 		}
 	}
 
 	function collapseFile(commitIndex: number, fileIndex: number): void {
-		state.expandedFiles.delete(fileKey(commitIndex, fileIndex));
+		const identity = fileIdentityAt(state, commitIndex, fileIndex);
+		if (identity !== null) state.expandedFiles.delete(identity.key);
 	}
 
 	async function loadDiffForKey(key: string): Promise<void> {
-		if (loadingDiffs.has(key) || state.diffCache.has(key)) return;
+		if (diffLoading.has(key) || state.diffCache.has(key)) return;
 
 		const parsed = parseFileKey(key);
-		if (!parsed) return;
-		const commit = state.scan.commits[parsed.commitIndex];
+		if (parsed === null) return;
+		const commit = state.scan.commits.find(current => current.hash === parsed.hash);
 		const files = commit === undefined ? undefined : state.filesCache.get(commit.hash);
-		const file = files?.[parsed.fileIndex];
-		if (!commit || !file) return;
+		const file = files?.find(current => current.path === parsed.path);
+		if (commit === undefined || file === undefined) return;
 
-		loadingDiffs.add(key);
+		diffLoading.add(key);
 		try {
-			const diffText = await getCommitFileDiff(commit.repoPath, commit.hash, file.path);
-			const currentCommit = state.scan.commits[parsed.commitIndex];
+			const diff = await getCommitFileDiff(commit.repoPath, commit.hash, file.path);
+			const currentCommit = state.scan.commits.find(current => current.hash === parsed.hash);
 			const currentFiles = currentCommit === undefined ? undefined : state.filesCache.get(currentCommit.hash);
-			const currentFile = currentFiles?.[parsed.fileIndex];
-			if (state.expandedFiles.has(key) && currentCommit?.hash === commit.hash && currentFile?.path === file.path) {
-				state.diffCache.set(key, diffText);
+			const fileStillVisible = currentFiles?.some(current => current.path === parsed.path) ?? false;
+			if (state.expandedFiles.has(key) && currentCommit !== undefined && fileStillVisible) {
+				state.diffCache.set(key, diff);
 				fullRender();
 			}
 		} catch (err) {
+			const message = String(err);
 			logger.error("Diff load failed", {
 				repoPath: commit.repoPath,
 				hash: commit.hash,
 				filePath: file.path,
-				error: String(err),
+				error: message,
 			});
 			if (state.expandedFiles.has(key)) {
-				state.expandedFiles.delete(key);
+				state.diffCache.set(key, { kind: "unavailable", message });
 				fullRender();
 			}
 		} finally {
-			loadingDiffs.delete(key);
+			diffLoading.delete(key);
 		}
 	}
 
 	function startMissingDiffLoads(): void {
-		for (const key of state.expandedFiles) {
+		for (const key of state.expandedFiles.keys()) {
 			if (!state.diffCache.has(key)) {
 				void loadDiffForKey(key);
 			}
@@ -546,17 +770,26 @@ export async function startTui(initial: ScanResult, onRefresh: () => Promise<Sca
 		if (shouldLoad) void loadFilesForCommit(commitIndex);
 	}
 
-	function toggleFile(commitIndex: number, fileIndex: number): void {
-		const key = fileKey(commitIndex, fileIndex);
-		if (state.expandedFiles.has(key)) {
-			state.expandedFiles.delete(key);
+	function cycleFile(commitIndex: number, fileIndex: number): void {
+		const identity = fileIdentityAt(state, commitIndex, fileIndex);
+		if (identity === null) return;
+
+		const mode = state.expandedFiles.get(identity.key);
+		if (mode === undefined) {
+			state.expandedFiles.set(identity.key, "hunks");
+			fullRender();
+			if (!state.diffCache.has(identity.key)) void loadDiffForKey(identity.key);
+			return;
+		}
+
+		if (mode === "hunks") {
+			state.expandedFiles.set(identity.key, "full");
 			fullRender();
 			return;
 		}
 
-		state.expandedFiles.add(key);
+		state.expandedFiles.delete(identity.key);
 		fullRender();
-		void loadDiffForKey(key);
 	}
 
 	async function handleForward(): Promise<void> {
@@ -569,7 +802,7 @@ export async function startTui(initial: ScanResult, onRefresh: () => Promise<Sca
 		}
 
 		if (line.kind === "file") {
-			toggleFile(line.commitIndex, line.fileIndex);
+			cycleFile(line.commitIndex, line.fileIndex);
 		}
 	}
 
@@ -578,10 +811,21 @@ export async function startTui(initial: ScanResult, onRefresh: () => Promise<Sca
 		const context = lineContext(lines, state.cursor);
 		if (!line || !context) return;
 
-		if ((line.kind === "diff" || line.kind === "message") && context.insideFile && context.fileIndex !== undefined) {
-			collapseFile(context.commitIndex, context.fileIndex);
-			fullRender();
-			return;
+		if (context.insideFile && context.fileIndex !== undefined) {
+			const identity = fileIdentityAt(state, context.commitIndex, context.fileIndex);
+			if (identity !== null) {
+				const mode = state.expandedFiles.get(identity.key);
+				if (mode === "full") {
+					state.expandedFiles.set(identity.key, "hunks");
+					fullRender();
+					return;
+				}
+				if (mode === "hunks") {
+					collapseFile(context.commitIndex, context.fileIndex);
+					fullRender();
+					return;
+				}
+			}
 		}
 
 		if (state.expandedCommits.has(context.commitIndex)) {
@@ -593,15 +837,13 @@ export async function startTui(initial: ScanResult, onRefresh: () => Promise<Sca
 	async function refreshScan(kind: "manual" | "auto"): Promise<void> {
 		if (refreshing) return;
 		refreshing = true;
-		const hash = cursorCommitHash(state, lines);
-		const fallbackCursor = state.cursor;
 
 		try {
 			const refreshed = await onRefresh();
-			remapStateForScan(state, refreshed);
-			lines = buildLines(state, term.width);
-			restoreCursorAfterRefresh(state, lines, hash, fallbackCursor);
-			clampCursorAndScroll(state, lines);
+			lines = withAnchoredRefresh(state, lines, () => {
+				remapStateForScan(state, refreshed);
+				return buildLines(state, term.width);
+			});
 			render(state, lines);
 			startMissingFileLoads();
 			startMissingDiffLoads();
@@ -696,16 +938,29 @@ export async function startTui(initial: ScanResult, onRefresh: () => Promise<Sca
 				await handleForward();
 				return;
 			}
-			case "MOUSE_RIGHT_BUTTON_PRESSED":
+			case "MOUSE_RIGHT_BUTTON_PRESSED": {
+				if (data.y >= 1 && data.y <= height) {
+					const lineIndex = state.scroll + (data.y - 1);
+					const line = lines[lineIndex];
+					if (line?.kind === "file") {
+						state.cursor = lineIndex;
+						ensureCursorVisible(state, height, lines.length);
+						await handleForward();
+						return;
+					}
+				}
+
 				handleBack();
 				return;
+			}
 			default:
 				return;
 		}
 	});
 
 	term.on("resize", () => {
-		fullRender();
+		lines = withAnchoredRefresh(state, lines, () => buildLines(state, term.width));
+		render(state, lines);
 	});
 
 	refreshTimer = setInterval(() => {

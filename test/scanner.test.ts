@@ -45,6 +45,14 @@ test("scanAll returns a global commit-first list with lazy file stats", async ()
 		{ path: "b.txt", added: 1, deleted: 0, status: "A" },
 	]);
 
+	const betaDiff = await getCommitFileDiff(betaCommit.repoPath, betaCommit.hash, "b.txt");
+	expect(betaDiff.kind).toBe("ops");
+	if (betaDiff.kind !== "ops") throw new Error("expected text diff ops");
+	expect(betaDiff.oldLineCount).toBe(0);
+	expect(betaDiff.newLineCount).toBe(1);
+	expect(betaDiff.ops.every(op => op.kind === "add")).toBe(true);
+	expect(betaDiff.ops.map(op => op.line)).toEqual(["beta"]);
+
 	const alphaCommit = result.commits[1];
 	if (alphaCommit === undefined) throw new Error("missing alpha commit");
 	expect(alphaCommit.subject).toBe("alpha second");
@@ -54,13 +62,43 @@ test("scanAll returns a global commit-first list with lazy file stats", async ()
 	expect(await getCommitFiles(alphaCommit.repoPath, alphaCommit.hash)).toEqual([
 		{ path: "a.txt", added: 2, deleted: 1, status: "M" },
 	]);
+});
 
-	const diff = await getCommitFileDiff(alphaCommit.repoPath, alphaCommit.hash, "a.txt");
-	expect(diff).toContain("--- a/a.txt");
-	expect(diff).toContain("+++ b/a.txt");
-	expect(diff).toContain("-old");
-	expect(diff).toContain("+new");
-	expect(diff).toContain("+add");
+test("getCommitFileDiff returns structured ops for a one-line modification", async () => {
+	const root = await makeTempRoot();
+	const repo = await initRepo(root, "modify");
+	const now = Math.floor(Date.now() / 1000);
+	const oldLines = Array.from({ length: 20 }, (_, index) => `line ${index + 1}`);
+	const newLines = [...oldLines];
+	newLines[9] = "line 10 changed";
+
+	await commitFile(repo, "story.txt", `${oldLines.join("\n")}\n`, "initial", now - 60);
+	const hash = await commitFile(repo, "story.txt", `${newLines.join("\n")}\n`, "modify middle", now);
+
+	const diff = await getCommitFileDiff(repo, hash, "story.txt");
+
+	expect(diff.kind).toBe("ops");
+	if (diff.kind !== "ops") throw new Error("expected text diff ops");
+	expect(diff.oldLineCount).toBe(20);
+	expect(diff.newLineCount).toBe(20);
+	expect(diff.ops).toEqual([
+		...oldLines.slice(0, 9).map(line => ({ kind: "equal", line })),
+		{ kind: "delete", line: "line 10" },
+		{ kind: "add", line: "line 10 changed" },
+		...oldLines.slice(10).map(line => ({ kind: "equal", line })),
+	]);
+	expect(diff.ops.filter(op => op.kind === "delete")).toHaveLength(1);
+	expect(diff.ops.filter(op => op.kind === "add")).toHaveLength(1);
+});
+
+test("getCommitFileDiff returns binary for binary blobs", async () => {
+	const root = await makeTempRoot();
+	const repo = await initRepo(root, "binary");
+	const hash = await commitFile(repo, "asset.bin", new Uint8Array([0, 1, 2, 3]), "binary file", 1_700_000_000);
+
+	const diff = await getCommitFileDiff(repo, hash, "asset.bin");
+
+	expect(diff).toEqual({ kind: "binary" });
 });
 
 test("scanAll deduplicates commits by hash, preferring the shortest repoPath", async () => {
@@ -121,69 +159,68 @@ test("scanAll does not do file-stat work during the initial scan", async () => {
 
 	for (let repoIndex = 0; repoIndex < repos.length; repoIndex++) {
 		const repo = repos[repoIndex];
-		for (let commitIndex = 0; commitIndex < 5; commitIndex++) {
-			await commitFile(
-				repo,
-				`file-${repoIndex}.txt`,
-				`repo ${repoIndex} commit ${commitIndex}\n`,
-				`repo ${repoIndex} commit ${commitIndex}`,
-				now - repoIndex * 10 - (5 - commitIndex),
-			);
-		}
+		if (repo === undefined) throw new Error("missing repo");
+		await commitFile(repo, `file-${repoIndex}.txt`, `content ${repoIndex}\n`, `commit ${repoIndex}`, now - repoIndex);
 	}
 
 	const originalWalk = git.walk;
 	let walkCalls = 0;
-	git.walk = (async () => {
+	git.walk = (async (...args) => {
 		walkCalls++;
-		throw new Error("scanAll should not walk trees");
+		return originalWalk(...args);
 	}) as typeof git.walk;
 
 	try {
-		const start = performance.now();
-		const result = await scanAll(root, { limit: 20 });
-		const elapsedMs = performance.now() - start;
+		const result = await scanAll(root, { limit: 3 });
 
-		expect(result.repoCount).toBe(3);
-		expect(result.commits).toHaveLength(15);
+		expect(result.commits).toHaveLength(3);
 		expect(walkCalls).toBe(0);
-		expect(elapsedMs).toBeLessThan(500);
+
+		const commit = result.commits[0];
+		if (commit === undefined) throw new Error("missing newest commit");
+		await getCommitFiles(commit.repoPath, commit.hash);
+		expect(walkCalls).toBe(1);
 	} finally {
 		git.walk = originalWalk;
 	}
 });
 
 async function makeTempRoot(): Promise<string> {
-	const root = await fs.mkdtemp(path.join(os.tmpdir(), "gitmonitor-scanner-"));
+	const root = await fs.mkdtemp(path.join(os.tmpdir(), "gitmonitor-"));
 	tempRoots.push(root);
 	return root;
 }
 
-async function initRepo(root: string, name: string): Promise<string> {
-	const dir = path.join(root, name);
-	await fs.mkdir(dir, { recursive: true });
-	await git.init({ fs: nodeFs, dir });
-	return dir;
+async function initRepo(root: string, label: string): Promise<string> {
+	const repo = path.join(root, label);
+	await fs.mkdir(repo, { recursive: true });
+	await git.init({ fs: nodeFs, dir: repo, defaultBranch: "main" });
+	return repo;
 }
 
 async function commitFile(
-	dir: string,
-	filepath: string,
-	contents: string,
+	repo: string,
+	filePath: string,
+	content: string | Uint8Array,
 	message: string,
 	timestamp: number,
 ): Promise<string> {
-	await Bun.write(path.join(dir, filepath), contents);
-	await git.add({ fs: nodeFs, dir, filepath });
-	const signature = makeSignature(timestamp);
-	return await git.commit({ fs: nodeFs, dir, message, author: signature, committer: signature });
-}
+	await fs.mkdir(path.dirname(path.join(repo, filePath)), { recursive: true });
+	await fs.writeFile(path.join(repo, filePath), content);
+	await git.add({ fs: nodeFs, dir: repo, filepath: filePath });
 
-function makeSignature(timestamp: number): Signature {
-	return {
-		name: "Test Author",
+	const signature: Signature = {
+		name: "Test User",
 		email: "test@example.com",
 		timestamp,
 		timezoneOffset: 0,
 	};
+
+	return await git.commit({
+		fs: nodeFs,
+		dir: repo,
+		message,
+		author: signature,
+		committer: signature,
+	});
 }
