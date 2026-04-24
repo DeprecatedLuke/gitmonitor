@@ -15,6 +15,7 @@
 		"fix": "biome check --fix --unsafe src/"
 	},
 	"dependencies": {
+		"isomorphic-git": "^1.27.0",
 		"terminal-kit": "^3.1.2"
 	},
 	"devDependencies": {

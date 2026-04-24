@@ -1,7 +1,7 @@
 import terminalKit from "terminal-kit";
-import type { RepoInfo } from "./git";
-import { getCommitDetail, getCommitFileDiff, getFileDiff } from "./git";
 import * as logger from "./logger";
+import type { CommitEntry, FileDiffStat, ScanResult } from "./scanner";
+import { getCommitFileDiff, getCommitFiles } from "./scanner";
 
 const term = terminalKit.terminal;
 
@@ -15,278 +15,44 @@ const DIM = "\x1b[2m";
 const BOLD = "\x1b[1m";
 const INVERSE = "\x1b[7m";
 const RESET = "\x1b[0m";
-const MAGENTA = "\x1b[35m";
+
+const EMPTY_MESSAGE = "No git repositories with commits found";
+const SCROLL_LINES = 3;
+const REFRESH_MS = 5000;
+const IDENTITY_SEPARATOR = "\u0000";
 
 // --- Line model ---
 
-type LineType = "header" | "section" | "commit" | "change" | "empty" | "message" | "diff";
-
-type Line = {
-	type: LineType;
-	repoIndex: number;
-	text: string;
-	/** Index into RepoInfo.changes, set on change lines */
-	changeIndex?: number;
-	/** Index into RepoInfo.commits, set on commit lines */
-	commitIndex?: number;
-	/** Commit hash, set on file lines within commit detail view */
-	commitHash?: string;
-};
-
-// --- Diff view state ---
-
-type DiffView = {
-	repoIndex: number;
-	lines: Line[];
-	cursor: number;
-	scroll: number;
-	/** Which mode to return to */
-	previousMode: "list" | "detail" | "commitView";
-};
-
-type CommitView = {
-	repoIndex: number;
-	commitIndex: number;
-	lines: Line[];
-	cursor: number;
-	scroll: number;
-	previousMode: "list" | "detail";
-};
-
-// --- View state ---
+type Line =
+	| { kind: "commit"; commitIndex: number; text: string }
+	| { kind: "file"; commitIndex: number; fileIndex: number; text: string }
+	| { kind: "diff"; commitIndex: number; fileIndex: number; text: string }
+	| { kind: "empty"; text: string }
+	| { kind: "message"; text: string };
 
 type ViewState = {
-	repos: RepoInfo[];
+	scan: ScanResult;
 	cursor: number;
 	scroll: number;
-	expanded: Set<number>;
-	detailRepo: number;
-	diffView: DiffView | null;
-	commitView: CommitView | null;
+	/** commit indexes whose file list is shown */
+	expandedCommits: Set<number>;
+	/** Cache of file stats by commit hash */
+	filesCache: Map<string, FileDiffStat[]>;
+	/** commit hashes whose file list is loading */
+	filesLoading: Set<string>;
+	/** "<commitIndex>:<fileIndex>" whose diff is shown */
+	expandedFiles: Set<string>;
+	/** Cache of diff text by the same "<commitIndex>:<fileIndex>" key */
+	diffCache: Map<string, string>;
 };
 
-// --- Line building ---
+type LineContext = {
+	commitIndex: number;
+	fileIndex?: number;
+	insideFile: boolean;
+};
 
-function statusColor(status: string): string {
-	switch (status) {
-		case "M":
-			return YELLOW;
-		case "A":
-			return GREEN;
-		case "D":
-			return RED;
-		case "??":
-			return DIM;
-		default:
-			return RESET;
-	}
-}
-
-/** Color a single diff line based on its prefix. */
-function colorDiffLine(raw: string): string {
-	if (raw.startsWith("+++") || raw.startsWith("---")) return `${BOLD}${raw}${RESET}`;
-	if (raw.startsWith("+")) return `${GREEN}${raw}${RESET}`;
-	if (raw.startsWith("-")) return `${RED}${raw}${RESET}`;
-	if (raw.startsWith("@@")) return `${CYAN}${raw}${RESET}`;
-	if (raw.startsWith("===")) return `${BOLD}${YELLOW}${raw}${RESET}`;
-	if (raw.startsWith("diff ")) return `${BOLD}${raw}${RESET}`;
-	return raw;
-}
-
-function buildChangeLines(repo: RepoInfo, repoIndex: number): Line[] {
-	const lines: Line[] = [];
-	for (let ci = 0; ci < repo.changes.length; ci++) {
-		const change = repo.changes[ci];
-		const sc = statusColor(change.status);
-		const statusStr = `${sc}${change.status.padEnd(2)}${RESET}`;
-		let diffStr = "";
-		if (change.added > 0 || change.deleted > 0) {
-			const parts: string[] = [];
-			if (change.added > 0) parts.push(`${GREEN}+${change.added}${RESET}`);
-			if (change.deleted > 0) parts.push(`${RED}-${change.deleted}${RESET}`);
-			diffStr = `  ${parts.join(" ")}`;
-		}
-		lines.push({
-			type: "change",
-			repoIndex,
-			changeIndex: ci,
-			text: `     ${statusStr} ${change.path}${diffStr}`,
-		});
-	}
-	return lines;
-}
-
-function buildListLines(state: ViewState): Line[] {
-	const lines: Line[] = [];
-
-	for (let i = 0; i < state.repos.length; i++) {
-		const repo = state.repos[i];
-		const expanded = state.expanded.has(i);
-		const arrow = expanded ? "▼" : "▶";
-		const header = ` ${arrow} ${BOLD}${repo.relativePath}/${RESET}${DIM}(${CYAN}${repo.branch}${RESET}${DIM})${RESET}`;
-		lines.push({ type: "header", repoIndex: i, text: header });
-
-		if (expanded) {
-			// Commits section
-			lines.push({ type: "section", repoIndex: i, text: `   Commits:` });
-			if (repo.commits.length === 0) {
-				lines.push({ type: "message", repoIndex: i, text: `     ${DIM}No commits yet${RESET}` });
-			} else {
-				for (let ci = 0; ci < repo.commits.length; ci++) {
-					const commit = repo.commits[ci];
-					const hash = `${YELLOW}${commit.hash}${RESET}`;
-					const subject = commit.subject;
-					const date = `${DIM}${commit.date}${RESET}`;
-					lines.push({
-						type: "commit",
-						repoIndex: i,
-						commitIndex: ci,
-						text: `     ${hash} ${subject}  ${date}`,
-					});
-				}
-			}
-
-			// Changes section
-			if (repo.changes.length === 0) {
-				lines.push({ type: "message", repoIndex: i, text: `   ${DIM}No uncommitted changes${RESET}` });
-			} else {
-				lines.push({
-					type: "section",
-					repoIndex: i,
-					text: `   Changes (${repo.changes.length} file${repo.changes.length === 1 ? "" : "s"}):`,
-				});
-				lines.push(...buildChangeLines(repo, i));
-			}
-
-			// Blank separator after expanded repo
-			lines.push({ type: "empty", repoIndex: i, text: "" });
-		}
-	}
-
-	return lines;
-}
-
-function buildDetailLines(state: ViewState): Line[] {
-	const repo = state.repos[state.detailRepo];
-	if (!repo) return [];
-
-	const lines: Line[] = [];
-
-	lines.push({
-		type: "header",
-		repoIndex: state.detailRepo,
-		text: ` ${BOLD}${repo.relativePath}/${RESET}${DIM}(${CYAN}${repo.branch}${RESET}${DIM})${RESET}`,
-	});
-	lines.push({
-		type: "message",
-		repoIndex: state.detailRepo,
-		text: ` ${DIM}Path: ${repo.path}${RESET}`,
-	});
-	lines.push({ type: "empty", repoIndex: state.detailRepo, text: "" });
-
-	// All commits
-	lines.push({ type: "section", repoIndex: state.detailRepo, text: ` ${BOLD}Commits:${RESET}` });
-	if (repo.commits.length === 0) {
-		lines.push({ type: "message", repoIndex: state.detailRepo, text: `   ${DIM}No commits yet${RESET}` });
-	} else {
-		for (let ci = 0; ci < repo.commits.length; ci++) {
-			const commit = repo.commits[ci];
-			const hash = `${YELLOW}${commit.hash}${RESET}`;
-			const author = `${MAGENTA}${commit.author}${RESET}`;
-			const date = `${DIM}${commit.date}${RESET}`;
-			lines.push({
-				type: "commit",
-				repoIndex: state.detailRepo,
-				commitIndex: ci,
-				text: `   ${hash} ${commit.subject}  ${author}  ${date}`,
-			});
-		}
-	}
-
-	lines.push({ type: "empty", repoIndex: state.detailRepo, text: "" });
-
-	// All changes
-	lines.push({ type: "section", repoIndex: state.detailRepo, text: ` ${BOLD}Changes:${RESET}` });
-	if (repo.changes.length === 0) {
-		lines.push({ type: "message", repoIndex: state.detailRepo, text: `   ${DIM}No uncommitted changes${RESET}` });
-	} else {
-		lines.push(...buildChangeLines(repo, state.detailRepo));
-	}
-
-	return lines;
-}
-
-function buildDiffLines(repoIndex: number, filePath: string, diffText: string): Line[] {
-	const lines: Line[] = [];
-	lines.push({
-		type: "header",
-		repoIndex,
-		text: ` ${BOLD}${filePath}${RESET}`,
-	});
-	lines.push({ type: "empty", repoIndex, text: "" });
-
-	for (const raw of diffText.split("\n")) {
-		lines.push({ type: "diff", repoIndex, text: ` ${colorDiffLine(raw)}` });
-	}
-	return lines;
-}
-
-function buildCommitDetailLines(
-	repoIndex: number,
-	detail: {
-		hash: string;
-		subject: string;
-		body: string;
-		author: string;
-		date: string;
-		files: { path: string; added: number; deleted: number; status: string }[];
-	},
-): Line[] {
-	const lines: Line[] = [];
-	lines.push({
-		type: "header",
-		repoIndex,
-		text: ` ${BOLD}${YELLOW}${detail.hash.slice(0, 7)}${RESET} ${detail.subject}`,
-	});
-	lines.push({ type: "empty", repoIndex, text: "" });
-	lines.push({
-		type: "message",
-		repoIndex,
-		text: ` ${MAGENTA}${detail.author}${RESET}  ${DIM}${detail.date}${RESET}`,
-	});
-	if (detail.body) {
-		lines.push({ type: "empty", repoIndex, text: "" });
-		for (const bodyLine of detail.body.split("\n")) {
-			lines.push({ type: "message", repoIndex, text: ` ${DIM}${bodyLine}${RESET}` });
-		}
-	}
-	lines.push({ type: "empty", repoIndex, text: "" });
-	lines.push({ type: "section", repoIndex, text: ` ${BOLD}Files (${detail.files.length}):${RESET}` });
-	for (let fi = 0; fi < detail.files.length; fi++) {
-		const f = detail.files[fi];
-		const parts: string[] = [];
-		if (f.added > 0) parts.push(`${GREEN}+${f.added}${RESET}`);
-		if (f.deleted > 0) parts.push(`${RED}-${f.deleted}${RESET}`);
-		const diffStr = parts.length > 0 ? `  ${parts.join(" ")}` : "";
-		lines.push({
-			type: "change",
-			repoIndex,
-			changeIndex: fi,
-			commitHash: detail.hash,
-			text: `   ${f.path}${diffStr}`,
-		});
-	}
-	return lines;
-}
-
-function buildLines(state: ViewState): Line[] {
-	if (state.diffView) return state.diffView.lines;
-	if (state.commitView) return state.commitView.lines;
-	if (state.detailRepo >= 0) return buildDetailLines(state);
-	return buildListLines(state);
-}
-
-// --- Rendering ---
+// --- ANSI-aware text helpers ---
 
 /** Strip ANSI escape sequences to get the visible character count. */
 function visibleLength(s: string): number {
@@ -314,26 +80,168 @@ function truncateAnsi(s: string, maxWidth: number): string {
 	return s.slice(0, i) + RESET;
 }
 
-function getMode(state: ViewState): string {
-	if (state.diffView) return "diff";
-	if (state.commitView) return "commit";
-	if (state.detailRepo >= 0) return "detail";
-	return "list";
+function truncateRow(s: string, width: number): string {
+	if (width <= 0) return "";
+	if (visibleLength(s) <= width) return s;
+	if (width === 1) return "…";
+	return `${truncateAnsi(s, width - 1)}…`;
 }
 
-/** Get the active cursor/scroll for the current view. */
-function activeView(state: ViewState): { cursor: number; scroll: number } {
-	if (state.diffView) return state.diffView;
-	if (state.commitView) return state.commitView;
-	return state;
+// --- Line building ---
+
+function fileKey(commitIndex: number, fileIndex: number): string {
+	return `${commitIndex}:${fileIndex}`;
+}
+
+function parseFileKey(key: string): { commitIndex: number; fileIndex: number } | null {
+	const separator = key.indexOf(":");
+	if (separator < 1 || separator === key.length - 1) return null;
+
+	const commitIndex = Number.parseInt(key.slice(0, separator), 10);
+	const fileIndex = Number.parseInt(key.slice(separator + 1), 10);
+	if (!Number.isInteger(commitIndex) || !Number.isInteger(fileIndex)) return null;
+	if (commitIndex < 0 || fileIndex < 0) return null;
+
+	return { commitIndex, fileIndex };
+}
+
+function identityKey(hash: string, path: string): string {
+	return `${hash}${IDENTITY_SEPARATOR}${path}`;
+}
+
+function centerDimMessage(text: string, width: number): string {
+	const padding = " ".repeat(Math.max(0, Math.floor((width - text.length) / 2)));
+	return `${padding}${DIM}${text}${RESET}`;
+}
+
+function colorDiffLine(raw: string): string {
+	if (raw === "Binary file differs") return `${DIM}${raw}${RESET}`;
+	if (raw.startsWith("+++") || raw.startsWith("---")) return `${BOLD}${raw}${RESET}`;
+	if (raw.startsWith("@@ ")) return `${CYAN}${raw}${RESET}`;
+	if (raw.startsWith("+")) return `${GREEN}${raw}${RESET}`;
+	if (raw.startsWith("-")) return `${RED}${raw}${RESET}`;
+	return raw;
+}
+
+function formatCommitLine(commit: CommitEntry, expanded: boolean): string {
+	const arrow = expanded ? "▼" : "▶";
+	return ` ${arrow} ${BOLD}${commit.repoLabel}${RESET}/${YELLOW}${commit.shortHash}${RESET}${DIM} - ${RESET}${commit.subject}`;
+}
+
+function formatFileLine(file: FileDiffStat, expanded: boolean): string {
+	const arrow = expanded ? "▼" : "▶";
+	const parts: string[] = [];
+	if (file.added > 0) parts.push(`${GREEN}+${file.added}${RESET}`);
+	if (file.deleted > 0) parts.push(`${RED}-${file.deleted}${RESET}`);
+	const stats = parts.length > 0 ? ` ${parts.join(" ")}` : "";
+	return `    ${arrow} ${file.path}${stats}`;
+}
+
+function buildLines(state: ViewState, width: number): Line[] {
+	if (state.scan.commits.length === 0) {
+		return [{ kind: "message", text: centerDimMessage(EMPTY_MESSAGE, width) }];
+	}
+
+	const lines: Line[] = [];
+	for (let commitIndex = 0; commitIndex < state.scan.commits.length; commitIndex++) {
+		const commit = state.scan.commits[commitIndex];
+		const commitExpanded = state.expandedCommits.has(commitIndex);
+		lines.push({
+			kind: "commit",
+			commitIndex,
+			text: formatCommitLine(commit, commitExpanded),
+		});
+
+		if (!commitExpanded) continue;
+
+		const files = state.filesCache.get(commit.hash);
+		if (files === undefined) {
+			lines.push({ kind: "message", text: `    ${DIM}Loading files…${RESET}` });
+			continue;
+		}
+
+		if (files.length === 0) {
+			lines.push({ kind: "message", text: `    ${DIM}(no file changes)${RESET}` });
+			continue;
+		}
+
+		for (let fileIndex = 0; fileIndex < files.length; fileIndex++) {
+			const file = files[fileIndex];
+			const key = fileKey(commitIndex, fileIndex);
+			const fileExpanded = state.expandedFiles.has(key);
+			lines.push({
+				kind: "file",
+				commitIndex,
+				fileIndex,
+				text: formatFileLine(file, fileExpanded),
+			});
+
+			if (!fileExpanded) continue;
+
+			const diffText = state.diffCache.get(key);
+			if (diffText === undefined) {
+				lines.push({ kind: "message", text: `      ${DIM}Loading diff…${RESET}` });
+				continue;
+			}
+
+			for (const raw of diffText.split("\n")) {
+				lines.push({
+					kind: "diff",
+					commitIndex,
+					fileIndex,
+					text: `      ${colorDiffLine(raw)}`,
+				});
+			}
+		}
+	}
+
+	return lines;
+}
+
+function lineContext(lines: Line[], lineIndex: number): LineContext | null {
+	const line = lines[lineIndex];
+	if (!line) return null;
+
+	if (line.kind === "commit") {
+		return { commitIndex: line.commitIndex, insideFile: false };
+	}
+	if (line.kind === "file" || line.kind === "diff") {
+		return { commitIndex: line.commitIndex, fileIndex: line.fileIndex, insideFile: true };
+	}
+
+	for (let i = lineIndex - 1; i >= 0; i--) {
+		const previous = lines[i];
+		if (previous.kind === "file") {
+			return { commitIndex: previous.commitIndex, fileIndex: previous.fileIndex, insideFile: true };
+		}
+		if (previous.kind === "commit") {
+			return { commitIndex: previous.commitIndex, insideFile: false };
+		}
+	}
+
+	return null;
+}
+
+function cursorCommitHash(state: ViewState, lines: Line[]): string | undefined {
+	const context = lineContext(lines, state.cursor);
+	if (!context) return undefined;
+	return state.scan.commits[context.commitIndex]?.hash;
+}
+
+// --- Rendering ---
+
+function statusLine(state: ViewState, lineCount: number): string {
+	const repoCount = state.scan.repoCount;
+	const commitCount = state.scan.commits.length;
+	const cursor = Math.min(state.cursor + 1, lineCount);
+	return ` ${INVERSE} gitmonitor ${RESET} ${DIM}${repoCount} repos · ${commitCount} commits · ${cursor}/${lineCount} · q:quit r:refresh${RESET}`;
 }
 
 function render(state: ViewState, lines: Line[]): void {
 	const w = term.width;
 	const h = term.height;
-	const { scroll, cursor } = activeView(state);
 
-	if (w < 40 || h < 10) {
+	if (w < 40 || h < 4) {
 		term.clear();
 		term.moveTo(1, 1);
 		term.styleReset();
@@ -341,11 +249,11 @@ function render(state: ViewState, lines: Line[]): void {
 		return;
 	}
 
-	// Status bar takes 1 line at the bottom
 	const viewHeight = h - 1;
+	const emptyScan = state.scan.commits.length === 0;
 
 	for (let row = 0; row < viewHeight; row++) {
-		const lineIndex = scroll + row;
+		const lineIndex = state.scroll + row;
 		term.moveTo(1, row + 1);
 		term.styleReset();
 		term.eraseLine();
@@ -353,13 +261,8 @@ function render(state: ViewState, lines: Line[]): void {
 		if (lineIndex >= lines.length) continue;
 
 		const line = lines[lineIndex];
-		const isCursor = lineIndex === cursor;
-
-		let content = line.text;
-		// Truncate to terminal width
-		if (visibleLength(content) > w) {
-			content = `${truncateAnsi(content, w - 1)}…`;
-		}
+		const content = truncateRow(line.text, w);
+		const isCursor = !emptyScan && lineIndex === state.cursor;
 
 		if (isCursor) {
 			term(INVERSE + content + RESET);
@@ -368,84 +271,346 @@ function render(state: ViewState, lines: Line[]): void {
 		}
 	}
 
-	// Status bar
 	term.moveTo(1, h);
 	term.styleReset();
 	term.eraseLine();
-	const repoCount = state.repos.length;
-	const lineInfo = `${cursor + 1}/${lines.length}`;
-	const mode = getMode(state);
-	const statusText = ` ${INVERSE} gitmonitor ${RESET} ${DIM}${repoCount} repo${repoCount === 1 ? "" : "s"} | ${mode} | ${lineInfo} | q:quit r:refresh${RESET}`;
-	if (visibleLength(statusText) > w) {
-		term(truncateAnsi(statusText, w));
-	} else {
-		term(statusText);
-	}
+	term(truncateRow(statusLine(state, lines.length), w));
 }
 
 // --- Scroll management ---
 
-function ensureCursorVisible(state: ViewState, viewHeight: number): void {
-	const view = activeView(state);
-	if (view.cursor < view.scroll) {
-		view.scroll = view.cursor;
-	} else if (view.cursor >= view.scroll + viewHeight) {
-		view.scroll = view.cursor - viewHeight + 1;
+function viewHeight(): number {
+	return Math.max(1, term.height - 1);
+}
+
+function ensureCursorVisible(state: ViewState, height: number, lineCount: number): void {
+	if (state.cursor < state.scroll) {
+		state.scroll = state.cursor;
+	} else if (state.cursor >= state.scroll + height) {
+		state.scroll = state.cursor - height + 1;
+	}
+
+	const maxScroll = Math.max(0, lineCount - height);
+	state.scroll = Math.max(0, Math.min(state.scroll, maxScroll));
+}
+
+function clampCursorAndScroll(state: ViewState, lines: Line[]): void {
+	const height = viewHeight();
+	const maxCursor = Math.max(0, lines.length - 1);
+	state.cursor = Math.max(0, Math.min(state.cursor, maxCursor));
+	ensureCursorVisible(state, height, lines.length);
+}
+
+function moveCursor(state: ViewState, lines: Line[], delta: number): void {
+	const maxCursor = Math.max(0, lines.length - 1);
+	state.cursor = Math.max(0, Math.min(state.cursor + delta, maxCursor));
+	ensureCursorVisible(state, viewHeight(), lines.length);
+}
+
+// --- Refresh state remapping ---
+
+function collectExpandedCommitHashes(state: ViewState): Set<string> {
+	const hashes = new Set<string>();
+	for (const commitIndex of state.expandedCommits) {
+		const commit = state.scan.commits[commitIndex];
+		if (commit) hashes.add(commit.hash);
+	}
+	return hashes;
+}
+
+function collectExpandedFileIdentities(state: ViewState): Set<string> {
+	const identities = new Set<string>();
+	for (const key of state.expandedFiles) {
+		const parsed = parseFileKey(key);
+		if (!parsed) continue;
+		const commit = state.scan.commits[parsed.commitIndex];
+		const files = commit === undefined ? undefined : state.filesCache.get(commit.hash);
+		const file = files?.[parsed.fileIndex];
+		if (commit && file) identities.add(identityKey(commit.hash, file.path));
+	}
+	return identities;
+}
+
+function collectDiffCacheByIdentity(state: ViewState): Map<string, string> {
+	const cache = new Map<string, string>();
+	for (const [key, diffText] of state.diffCache) {
+		const parsed = parseFileKey(key);
+		if (!parsed) continue;
+		const commit = state.scan.commits[parsed.commitIndex];
+		const files = commit === undefined ? undefined : state.filesCache.get(commit.hash);
+		const file = files?.[parsed.fileIndex];
+		if (commit && file) cache.set(identityKey(commit.hash, file.path), diffText);
+	}
+	return cache;
+}
+
+function remapStateForScan(state: ViewState, nextScan: ScanResult): void {
+	const expandedCommitHashes = collectExpandedCommitHashes(state);
+	const expandedFileIdentities = collectExpandedFileIdentities(state);
+	const cacheByIdentity = collectDiffCacheByIdentity(state);
+	const nextCommitHashes = new Set(nextScan.commits.map(commit => commit.hash));
+	const nextFilesCache = new Map<string, FileDiffStat[]>();
+	const nextFilesLoading = new Set<string>();
+
+	for (const [hash, files] of state.filesCache) {
+		if (nextCommitHashes.has(hash)) nextFilesCache.set(hash, files);
+	}
+	for (const hash of state.filesLoading) {
+		if (nextCommitHashes.has(hash)) nextFilesLoading.add(hash);
+	}
+
+	state.scan = nextScan;
+	state.expandedCommits = new Set<number>();
+	state.filesCache = nextFilesCache;
+	state.filesLoading = nextFilesLoading;
+	state.expandedFiles = new Set<string>();
+	state.diffCache = new Map<string, string>();
+
+	for (let commitIndex = 0; commitIndex < state.scan.commits.length; commitIndex++) {
+		const commit = state.scan.commits[commitIndex];
+		if (expandedCommitHashes.has(commit.hash)) {
+			state.expandedCommits.add(commitIndex);
+		}
+
+		const files = state.filesCache.get(commit.hash) ?? [];
+		for (let fileIndex = 0; fileIndex < files.length; fileIndex++) {
+			const file = files[fileIndex];
+			const identity = identityKey(commit.hash, file.path);
+			const key = fileKey(commitIndex, fileIndex);
+
+			if (expandedFileIdentities.has(identity)) {
+				state.expandedCommits.add(commitIndex);
+				state.expandedFiles.add(key);
+			}
+
+			if (cacheByIdentity.has(identity)) {
+				state.diffCache.set(key, cacheByIdentity.get(identity) ?? "");
+			}
+		}
 	}
 }
 
-// --- Input handling ---
+function findCommitLine(lines: Line[], commitIndex: number): number {
+	return lines.findIndex(line => line.kind === "commit" && line.commitIndex === commitIndex);
+}
 
-function repoIndexForLine(lines: Line[], lineIndex: number): number {
-	if (lineIndex < 0 || lineIndex >= lines.length) return -1;
-	return lines[lineIndex].repoIndex;
+function restoreCursorAfterRefresh(
+	state: ViewState,
+	lines: Line[],
+	hash: string | undefined,
+	fallbackCursor: number,
+): void {
+	if (hash) {
+		const commitIndex = state.scan.commits.findIndex(commit => commit.hash === hash);
+		if (commitIndex >= 0) {
+			const lineIndex = findCommitLine(lines, commitIndex);
+			if (lineIndex >= 0) {
+				state.cursor = lineIndex;
+				return;
+			}
+		}
+	}
+
+	state.cursor = fallbackCursor;
 }
 
 // --- Main entry point ---
 
-export async function startTui(repos: RepoInfo[], onRefresh: () => Promise<RepoInfo[]>): Promise<void> {
+export async function startTui(initial: ScanResult, onRefresh: () => Promise<ScanResult>): Promise<void> {
 	const { promise, resolve } = Promise.withResolvers<void>();
 
 	const state: ViewState = {
-		repos,
+		scan: initial,
 		cursor: 0,
 		scroll: 0,
-		expanded: new Set(),
-		detailRepo: -1,
-		diffView: null,
-		commitView: null,
+		expandedCommits: new Set(),
+		expandedFiles: new Set(),
+		diffCache: new Map(),
+		filesCache: new Map(),
+		filesLoading: new Set(),
 	};
 
-	let lines = buildLines(state);
+	const loadingDiffs = new Set<string>();
+	let lines = buildLines(state, term.width);
+	let refreshTimer: NodeJS.Timeout | undefined;
+	let refreshing = false;
 
 	function fullRender(): void {
-		lines = buildLines(state);
-		const viewHeight = term.height - 1;
-		const view = activeView(state);
-		if (lines.length === 0) {
-			view.cursor = 0;
-			view.scroll = 0;
-		} else {
-			view.cursor = Math.max(0, Math.min(view.cursor, lines.length - 1));
-		}
-		ensureCursorVisible(state, viewHeight);
+		lines = buildLines(state, term.width);
+		clampCursorAndScroll(state, lines);
 		render(state, lines);
 	}
 
-	function handleEmpty(): boolean {
-		if (state.repos.length === 0) {
-			term.clear();
-			term.moveTo(1, 1);
-			term.styleReset();
-			term(`${DIM}No git repositories found${RESET}`);
-			term.moveTo(1, term.height);
-			term(`${INVERSE} gitmonitor ${RESET} ${DIM}q:quit r:refresh${RESET}`);
-			return true;
+	async function loadFilesForCommit(commitIndex: number): Promise<void> {
+		const commit = state.scan.commits[commitIndex];
+		if (!commit || state.filesCache.has(commit.hash) || state.filesLoading.has(commit.hash)) return;
+
+		state.filesLoading.add(commit.hash);
+		let shouldRender = false;
+		try {
+			const files = await getCommitFiles(commit.repoPath, commit.hash);
+			const currentIndex = state.scan.commits.findIndex(current => current.hash === commit.hash);
+			if (currentIndex !== -1) {
+				state.filesCache.set(commit.hash, files);
+				shouldRender = state.expandedCommits.has(currentIndex);
+			}
+		} catch (err) {
+			logger.error("File list load failed", {
+				repoPath: commit.repoPath,
+				hash: commit.hash,
+				error: String(err),
+			});
+			const currentIndex = state.scan.commits.findIndex(current => current.hash === commit.hash);
+			if (currentIndex !== -1) {
+				state.filesCache.set(commit.hash, []);
+				shouldRender = state.expandedCommits.has(currentIndex);
+			}
+		} finally {
+			state.filesLoading.delete(commit.hash);
 		}
-		return false;
+
+		if (shouldRender) fullRender();
 	}
 
-	let refreshTimer: NodeJS.Timeout | undefined;
+	function startMissingFileLoads(): void {
+		for (const commitIndex of state.expandedCommits) {
+			void loadFilesForCommit(commitIndex);
+		}
+	}
+
+	function collapseCommit(commitIndex: number): void {
+		state.expandedCommits.delete(commitIndex);
+		for (const key of [...state.expandedFiles]) {
+			const parsed = parseFileKey(key);
+			if (parsed?.commitIndex === commitIndex) state.expandedFiles.delete(key);
+		}
+	}
+
+	function collapseFile(commitIndex: number, fileIndex: number): void {
+		state.expandedFiles.delete(fileKey(commitIndex, fileIndex));
+	}
+
+	async function loadDiffForKey(key: string): Promise<void> {
+		if (loadingDiffs.has(key) || state.diffCache.has(key)) return;
+
+		const parsed = parseFileKey(key);
+		if (!parsed) return;
+		const commit = state.scan.commits[parsed.commitIndex];
+		const files = commit === undefined ? undefined : state.filesCache.get(commit.hash);
+		const file = files?.[parsed.fileIndex];
+		if (!commit || !file) return;
+
+		loadingDiffs.add(key);
+		try {
+			const diffText = await getCommitFileDiff(commit.repoPath, commit.hash, file.path);
+			const currentCommit = state.scan.commits[parsed.commitIndex];
+			const currentFiles = currentCommit === undefined ? undefined : state.filesCache.get(currentCommit.hash);
+			const currentFile = currentFiles?.[parsed.fileIndex];
+			if (state.expandedFiles.has(key) && currentCommit?.hash === commit.hash && currentFile?.path === file.path) {
+				state.diffCache.set(key, diffText);
+				fullRender();
+			}
+		} catch (err) {
+			logger.error("Diff load failed", {
+				repoPath: commit.repoPath,
+				hash: commit.hash,
+				filePath: file.path,
+				error: String(err),
+			});
+			if (state.expandedFiles.has(key)) {
+				state.expandedFiles.delete(key);
+				fullRender();
+			}
+		} finally {
+			loadingDiffs.delete(key);
+		}
+	}
+
+	function startMissingDiffLoads(): void {
+		for (const key of state.expandedFiles) {
+			if (!state.diffCache.has(key)) {
+				void loadDiffForKey(key);
+			}
+		}
+	}
+
+	function toggleCommit(commitIndex: number): void {
+		let shouldLoad = false;
+		if (state.expandedCommits.has(commitIndex)) {
+			collapseCommit(commitIndex);
+		} else {
+			state.expandedCommits.add(commitIndex);
+			shouldLoad = true;
+		}
+		fullRender();
+		if (shouldLoad) void loadFilesForCommit(commitIndex);
+	}
+
+	function toggleFile(commitIndex: number, fileIndex: number): void {
+		const key = fileKey(commitIndex, fileIndex);
+		if (state.expandedFiles.has(key)) {
+			state.expandedFiles.delete(key);
+			fullRender();
+			return;
+		}
+
+		state.expandedFiles.add(key);
+		fullRender();
+		void loadDiffForKey(key);
+	}
+
+	async function handleForward(): Promise<void> {
+		const line = lines[state.cursor];
+		if (!line) return;
+
+		if (line.kind === "commit") {
+			toggleCommit(line.commitIndex);
+			return;
+		}
+
+		if (line.kind === "file") {
+			toggleFile(line.commitIndex, line.fileIndex);
+		}
+	}
+
+	function handleBack(): void {
+		const line = lines[state.cursor];
+		const context = lineContext(lines, state.cursor);
+		if (!line || !context) return;
+
+		if ((line.kind === "diff" || line.kind === "message") && context.insideFile && context.fileIndex !== undefined) {
+			collapseFile(context.commitIndex, context.fileIndex);
+			fullRender();
+			return;
+		}
+
+		if (state.expandedCommits.has(context.commitIndex)) {
+			collapseCommit(context.commitIndex);
+			fullRender();
+		}
+	}
+
+	async function refreshScan(kind: "manual" | "auto"): Promise<void> {
+		if (refreshing) return;
+		refreshing = true;
+		const hash = cursorCommitHash(state, lines);
+		const fallbackCursor = state.cursor;
+
+		try {
+			const refreshed = await onRefresh();
+			remapStateForScan(state, refreshed);
+			lines = buildLines(state, term.width);
+			restoreCursorAfterRefresh(state, lines, hash, fallbackCursor);
+			clampCursorAndScroll(state, lines);
+			render(state, lines);
+			startMissingFileLoads();
+			startMissingDiffLoads();
+		} catch (err) {
+			logger.error(kind === "auto" ? "Auto-refresh failed" : "Refresh failed", { error: String(err) });
+		} finally {
+			refreshing = false;
+		}
+	}
 
 	function cleanup(): void {
 		if (refreshTimer) clearInterval(refreshTimer);
@@ -455,166 +620,15 @@ export async function startTui(repos: RepoInfo[], onRefresh: () => Promise<RepoI
 		term.grabInput(false);
 	}
 
-	async function openDiff(ri: number, filePath: string, status: string): Promise<void> {
-		const repo = state.repos[ri];
-		if (!repo) return;
-		const diffText = await getFileDiff(repo.path, filePath, status);
-		const diffLines = buildDiffLines(ri, filePath, diffText);
-		let previousMode: DiffView["previousMode"] = "list";
-		if (state.commitView) previousMode = "commitView";
-		else if (state.detailRepo >= 0) previousMode = "detail";
-		state.diffView = { repoIndex: ri, lines: diffLines, cursor: 0, scroll: 0, previousMode };
-		lines = diffLines;
-		render(state, lines);
-	}
-
-	async function openCommitFileDiff(ri: number, hash: string, filePath: string): Promise<void> {
-		const repo = state.repos[ri];
-		if (!repo) return;
-		const diffText = await getCommitFileDiff(repo.path, hash, filePath);
-		const diffLines = buildDiffLines(ri, filePath, diffText);
-		state.diffView = { repoIndex: ri, lines: diffLines, cursor: 0, scroll: 0, previousMode: "commitView" };
-		lines = diffLines;
-		render(state, lines);
-	}
-
-	async function openCommit(ri: number, ci: number): Promise<void> {
-		const repo = state.repos[ri];
-		if (!repo || ci < 0 || ci >= repo.commits.length) return;
-		const commit = repo.commits[ci];
-		const detail = await getCommitDetail(repo.path, commit.hash);
-		const commitLines = buildCommitDetailLines(ri, detail);
-		const previousMode: CommitView["previousMode"] = state.detailRepo >= 0 ? "detail" : "list";
-		state.commitView = { repoIndex: ri, commitIndex: ci, lines: commitLines, cursor: 0, scroll: 0, previousMode };
-		lines = commitLines;
-		render(state, lines);
-	}
-
-	function closeDiff(): void {
-		if (!state.diffView) return;
-		const prev = state.diffView.previousMode;
-		state.diffView = null;
-		if (prev === "commitView") {
-			// Return to commit view — lines are still there
-			if (state.commitView) {
-				lines = state.commitView.lines;
-				render(state, lines);
-				return;
-			}
-		}
-		fullRender();
-	}
-
-	function closeCommit(): void {
-		if (!state.commitView) return;
-		state.commitView = null;
-		fullRender();
-	}
-
 	// Setup terminal
 	term.fullscreen(true);
 	term.hideCursor();
 	term.grabInput({ mouse: "button" });
-
-	if (!handleEmpty()) {
-		fullRender();
-	}
-
-	// --- Shared action helpers ---
-
-	async function handleForward(): Promise<void> {
-		if (state.diffView) return;
-
-		if (state.commitView) {
-			const line = lines[state.commitView.cursor];
-			if (line?.type === "change" && line.commitHash) {
-				const repo = state.repos[line.repoIndex];
-				if (repo) {
-					const filePath = line.text
-						.replace(/\x1b\[[0-9;]*m/g, "")
-						.trim()
-						.split("  ")[0];
-					await openCommitFileDiff(line.repoIndex, line.commitHash, filePath);
-				}
-			}
-			return;
-		}
-
-		const line = lines[state.cursor];
-		if (!line) return;
-
-		if (line.type === "change" && line.changeIndex !== undefined) {
-			const repo = state.repos[line.repoIndex];
-			if (repo) {
-				const change = repo.changes[line.changeIndex];
-				if (change) await openDiff(line.repoIndex, change.path, change.status);
-			}
-			return;
-		}
-
-		if (line.type === "commit" && line.commitIndex !== undefined) {
-			await openCommit(line.repoIndex, line.commitIndex);
-			return;
-		}
-
-		if (line.type === "header") {
-			const ri = line.repoIndex;
-			if (state.detailRepo >= 0) return;
-			if (state.expanded.has(ri)) {
-				state.detailRepo = ri;
-				state.cursor = 0;
-				state.scroll = 0;
-			} else {
-				state.expanded.add(ri);
-			}
-			fullRender();
-		}
-	}
-
-	function handleBack(): void {
-		if (state.diffView) {
-			closeDiff();
-			return;
-		}
-
-		if (state.commitView) {
-			closeCommit();
-			return;
-		}
-
-		const viewHeight = term.height - 1;
-
-		if (state.detailRepo >= 0) {
-			const prevRepo = state.detailRepo;
-			state.detailRepo = -1;
-			state.cursor = 0;
-			state.scroll = 0;
-			fullRender();
-			for (let li = 0; li < lines.length; li++) {
-				if (lines[li].type === "header" && lines[li].repoIndex === prevRepo) {
-					state.cursor = li;
-					ensureCursorVisible(state, viewHeight);
-					render(state, lines);
-					break;
-				}
-			}
-			return;
-		}
-
-		const ri = repoIndexForLine(lines, state.cursor);
-		if (ri >= 0 && state.expanded.has(ri)) {
-			state.expanded.delete(ri);
-			fullRender();
-		}
-	}
+	fullRender();
 
 	// --- Keyboard input ---
 
 	term.on("key", async (name: string) => {
-		const viewHeight = term.height - 1;
-		const view = activeView(state);
-
-		// Universal keys
 		switch (name) {
 			case "q":
 			case "CTRL_C":
@@ -624,34 +638,22 @@ export async function startTui(repos: RepoInfo[], onRefresh: () => Promise<RepoI
 				return;
 			case "UP":
 			case "k":
-				if (view.cursor > 0) {
-					view.cursor--;
-					ensureCursorVisible(state, viewHeight);
-					render(state, lines);
-				}
+				moveCursor(state, lines, -1);
+				render(state, lines);
 				return;
 			case "DOWN":
 			case "j":
-				if (view.cursor < lines.length - 1) {
-					view.cursor++;
-					ensureCursorVisible(state, viewHeight);
-					render(state, lines);
-				}
+				moveCursor(state, lines, 1);
+				render(state, lines);
 				return;
 			case "PAGE_UP":
-				view.cursor = Math.max(0, view.cursor - viewHeight);
-				ensureCursorVisible(state, viewHeight);
+				moveCursor(state, lines, -viewHeight());
 				render(state, lines);
 				return;
 			case "PAGE_DOWN":
-				view.cursor = Math.min(lines.length - 1, view.cursor + viewHeight);
-				ensureCursorVisible(state, viewHeight);
+				moveCursor(state, lines, viewHeight());
 				render(state, lines);
 				return;
-		}
-
-		// Forward / back
-		switch (name) {
 			case "RIGHT":
 			case "l":
 			case "ENTER":
@@ -662,21 +664,9 @@ export async function startTui(repos: RepoInfo[], onRefresh: () => Promise<RepoI
 			case "ESCAPE":
 				handleBack();
 				return;
-			case "r": {
-				try {
-					const refreshed = await onRefresh();
-					state.repos = refreshed;
-					state.detailRepo = -1;
-					state.diffView = null;
-					state.commitView = null;
-					if (!handleEmpty()) {
-						fullRender();
-					}
-				} catch (err) {
-					logger.error("Refresh failed", { error: String(err) });
-				}
+			case "r":
+				await refreshScan("manual");
 				return;
-			}
 			default:
 				return;
 		}
@@ -684,28 +674,24 @@ export async function startTui(repos: RepoInfo[], onRefresh: () => Promise<RepoI
 
 	// --- Mouse input ---
 
-	const SCROLL_LINES = 3;
-
 	term.on("mouse", async (name: string, data: { x: number; y: number }) => {
-		const viewHeight = term.height - 1;
-		const view = activeView(state);
+		const height = viewHeight();
 
 		switch (name) {
 			case "MOUSE_WHEEL_UP":
-				view.cursor = Math.max(0, view.cursor - SCROLL_LINES);
-				ensureCursorVisible(state, viewHeight);
+				moveCursor(state, lines, -SCROLL_LINES);
 				render(state, lines);
 				return;
 			case "MOUSE_WHEEL_DOWN":
-				view.cursor = Math.min(lines.length - 1, view.cursor + SCROLL_LINES);
-				ensureCursorVisible(state, viewHeight);
+				moveCursor(state, lines, SCROLL_LINES);
 				render(state, lines);
 				return;
 			case "MOUSE_LEFT_BUTTON_PRESSED": {
-				// Map screen row to line index
-				const lineIndex = view.scroll + (data.y - 1);
+				if (data.y < 1 || data.y > height) return;
+				const lineIndex = state.scroll + (data.y - 1);
 				if (lineIndex < 0 || lineIndex >= lines.length) return;
-				view.cursor = lineIndex;
+				state.cursor = lineIndex;
+				ensureCursorVisible(state, height, lines.length);
 				render(state, lines);
 				await handleForward();
 				return;
@@ -713,28 +699,18 @@ export async function startTui(repos: RepoInfo[], onRefresh: () => Promise<RepoI
 			case "MOUSE_RIGHT_BUTTON_PRESSED":
 				handleBack();
 				return;
+			default:
+				return;
 		}
 	});
 
-	term.on("resize", (_width: number, _height: number) => {
-		if (!handleEmpty()) {
-			fullRender();
-		}
+	term.on("resize", () => {
+		fullRender();
 	});
 
-	// Auto-refresh every 5 seconds
-	refreshTimer = setInterval(async () => {
-		try {
-			const refreshed = await onRefresh();
-			state.repos = refreshed;
-			// Don't reset view mode on auto-refresh — just update data in place
-			if (!handleEmpty()) {
-				fullRender();
-			}
-		} catch (err) {
-			logger.error("Auto-refresh failed", { error: String(err) });
-		}
-	}, 5000);
+	refreshTimer = setInterval(() => {
+		void refreshScan("auto");
+	}, REFRESH_MS);
 
 	return promise;
 }
