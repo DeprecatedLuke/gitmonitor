@@ -125,30 +125,30 @@ test("getCommitFiles returns cached empty stats when commit file stats cannot be
 	const now = Math.floor(Date.now() / 1000);
 	const hash = await commitFile(repo, "missing.txt", "content\n", "broken tree", now);
 
-	const originalWalk = git.walk;
-	let walkCalls = 0;
-	git.walk = (async () => {
-		walkCalls++;
+	const originalReadTree = git.readTree;
+	let readTreeCalls = 0;
+	git.readTree = (async () => {
+		readTreeCalls++;
 		const err = new Error("Could not find missing object");
 		err.name = "NotFoundError";
 		(err as Error & { code: string }).code = "NotFoundError";
 		throw err;
-	}) as typeof git.walk;
+	}) as typeof git.readTree;
 
 	try {
 		const result = await scanAll(root, { limit: 1 });
 
 		expect(result.commits).toHaveLength(1);
-		expect(walkCalls).toBe(0);
+		expect(readTreeCalls).toBe(0);
 		const commit = result.commits[0];
 		if (commit === undefined) throw new Error("missing broken commit");
 		expect(commit.hash).toBe(hash);
 
 		expect(await getCommitFiles(commit.repoPath, commit.hash)).toEqual([]);
 		expect(await getCommitFiles(commit.repoPath, commit.hash)).toEqual([]);
-		expect(walkCalls).toBe(1);
+		expect(readTreeCalls).toBe(1);
 	} finally {
-		git.walk = originalWalk;
+		git.readTree = originalReadTree;
 	}
 });
 
@@ -163,25 +163,25 @@ test("scanAll does not do file-stat work during the initial scan", async () => {
 		await commitFile(repo, `file-${repoIndex}.txt`, `content ${repoIndex}\n`, `commit ${repoIndex}`, now - repoIndex);
 	}
 
-	const originalWalk = git.walk;
-	let walkCalls = 0;
-	git.walk = (async (...args) => {
-		walkCalls++;
-		return originalWalk(...args);
-	}) as typeof git.walk;
+	const originalReadTree = git.readTree;
+	let readTreeCalls = 0;
+	git.readTree = (async (...args) => {
+		readTreeCalls++;
+		return originalReadTree(...args);
+	}) as typeof git.readTree;
 
 	try {
 		const result = await scanAll(root, { limit: 3 });
 
 		expect(result.commits).toHaveLength(3);
-		expect(walkCalls).toBe(0);
+		expect(readTreeCalls).toBe(0);
 
 		const commit = result.commits[0];
 		if (commit === undefined) throw new Error("missing newest commit");
 		await getCommitFiles(commit.repoPath, commit.hash);
-		expect(walkCalls).toBe(1);
+		expect(readTreeCalls).toBeGreaterThanOrEqual(1);
 	} finally {
-		git.walk = originalWalk;
+		git.readTree = originalReadTree;
 	}
 });
 

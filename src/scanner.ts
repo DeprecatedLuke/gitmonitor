@@ -1,7 +1,7 @@
 import * as nodeFs from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import git, { type ReadCommitResult, type WalkerEntry } from "isomorphic-git";
+import git, { type ReadCommitResult, type TreeEntry } from "isomorphic-git";
 import * as logger from "./logger";
 
 export type FileDiffStat = {
@@ -40,14 +40,6 @@ export type ScanOptions = {
 export type ScanResult = {
 	commits: CommitEntry[];
 	repoCount: number;
-};
-
-type WalkerEntryType = "tree" | "blob" | "special" | "commit";
-
-type EntryInfo = {
-	entry: WalkerEntry;
-	oid: string;
-	type: WalkerEntryType;
 };
 
 type CachedCommitEntry = Omit<CommitEntry, "dateRelative" | "repoLabel">;
@@ -374,84 +366,152 @@ function parseCommitMessage(raw: string): { subject: string; body: string } {
 
 async function readCommitFileStats(repoPath: string, commit: ReadCommitResult): Promise<FileDiffStat[]> {
 	const parentHash = commit.commit.parent[0] ?? null;
-	const trees =
-		parentHash === null
-			? [git.TREE({ ref: commit.oid })]
-			: [git.TREE({ ref: parentHash }), git.TREE({ ref: commit.oid })];
-	const result = (await git.walk({
-		fs: nodeFs,
-		dir: repoPath,
-		trees,
-		map: async (filepath, entries) => {
-			const oldEntry = parentHash === null ? null : entries[0];
-			const newEntry = parentHash === null ? entries[0] : entries[1];
-			return await mapDiffEntry(repoPath, filepath, oldEntry ?? null, newEntry ?? null);
-		},
-		reduce: async (parent, children) => {
-			const stats: FileDiffStat[] = [];
-			collectDiffStats(parent, stats);
-			for (const child of children) {
-				collectDiffStats(child, stats);
-			}
-			return stats;
-		},
-	})) as FileDiffStat[];
-
-	result.sort((a, b) => a.path.localeCompare(b.path));
-	return result;
+	const parentTree = parentHash === null ? null : await resolveCommitTree(repoPath, parentHash);
+	const currentTree = await resolveCommitTree(repoPath, commit.oid);
+	const out: FileDiffStat[] = [];
+	await diffTreeStats(repoPath, parentTree, currentTree, "", out);
+	out.sort((a, b) => a.path.localeCompare(b.path));
+	return out;
 }
 
-async function mapDiffEntry(
-	repoPath: string,
-	filePath: string,
-	oldEntry: WalkerEntry | null,
-	newEntry: WalkerEntry | null,
-): Promise<FileDiffStat | undefined | null> {
+async function resolveCommitTree(repoPath: string, commitOid: string): Promise<string | null> {
 	try {
-		if (filePath === ".") return undefined;
-
-		const [oldInfo, newInfo] = await Promise.all([readEntryInfo(oldEntry), readEntryInfo(newEntry)]);
-		if (oldInfo?.type === "tree" || newInfo?.type === "tree") {
-			if (oldInfo !== null && newInfo !== null && oldInfo.type !== newInfo.type) {
-				return { path: filePath, added: 0, deleted: 0, status: "T" };
-			}
-			return undefined;
-		}
-
-		if (oldInfo !== null && newInfo !== null && oldInfo.oid === newInfo.oid) {
+		const commit = await git.readCommit({ fs: nodeFs, dir: repoPath, oid: commitOid });
+		return commit.commit.tree;
+	} catch (err) {
+		if (isNotFoundError(err)) {
+			logger.debug("commit files failed", { repo: repoPath, hash: commitOid, error: String(err) });
 			return null;
 		}
-
-		const status = getFileStatus(oldInfo, newInfo);
-		const counts = await countEntryLineChanges(repoPath, oldInfo, newInfo);
-		return { path: filePath, added: counts.added, deleted: counts.deleted, status };
-	} catch (err) {
-		logger.debug("file diff failed", { repo: repoPath, path: filePath, error: String(err) });
-		return null;
+		throw err;
 	}
 }
 
-async function readEntryInfo(entry: WalkerEntry | null): Promise<EntryInfo | null> {
-	if (entry === null) return null;
-	const [type, oid] = await Promise.all([entry.type(), entry.oid()]);
-	return { entry, type, oid };
-}
-
-function getFileStatus(oldInfo: EntryInfo | null, newInfo: EntryInfo | null): FileDiffStat["status"] {
-	if (oldInfo === null) return "A";
-	if (newInfo === null) return "D";
-	if (oldInfo.type !== newInfo.type) return "T";
-	return "M";
-}
-
-async function countEntryLineChanges(
+async function diffTreeStats(
 	repoPath: string,
-	oldInfo: EntryInfo | null,
-	newInfo: EntryInfo | null,
+	oldTreeOid: string | null,
+	newTreeOid: string | null,
+	prefix: string,
+	out: FileDiffStat[],
+): Promise<void> {
+	if (oldTreeOid !== null && newTreeOid !== null && oldTreeOid === newTreeOid) return;
+
+	let oldEntries: TreeEntry[];
+	let newEntries: TreeEntry[];
+	try {
+		[oldEntries, newEntries] = await Promise.all([
+			readTreeEntries(repoPath, oldTreeOid),
+			readTreeEntries(repoPath, newTreeOid),
+		]);
+	} catch (err) {
+		logger.debug("file diff failed", { repo: repoPath, path: prefix, error: String(err) });
+		return;
+	}
+
+	const oldByName = new Map(oldEntries.map(entry => [entry.path, entry] as const));
+	const newByName = new Map(newEntries.map(entry => [entry.path, entry] as const));
+	const names = [...new Set([...oldByName.keys(), ...newByName.keys()])].sort((a, b) => a.localeCompare(b));
+
+	for (const name of names) {
+		const oldEntry = oldByName.get(name) ?? null;
+		const newEntry = newByName.get(name) ?? null;
+		if (oldEntry === null && newEntry === null) continue;
+
+		const filePath = prefix === "" ? name : `${prefix}/${name}`;
+		try {
+			await diffTreeEntry(repoPath, oldEntry, newEntry, filePath, out);
+		} catch (err) {
+			logger.debug("file diff failed", { repo: repoPath, path: filePath, error: String(err) });
+		}
+	}
+}
+
+async function diffTreeEntry(
+	repoPath: string,
+	oldEntry: TreeEntry | null,
+	newEntry: TreeEntry | null,
+	filePath: string,
+	out: FileDiffStat[],
+): Promise<void> {
+	if (oldEntry !== null && newEntry !== null) {
+		if (oldEntry.oid === newEntry.oid) return;
+
+		if (oldEntry.type === "tree" && newEntry.type === "tree") {
+			await diffTreeStats(repoPath, oldEntry.oid, newEntry.oid, filePath, out);
+			return;
+		}
+
+		if (oldEntry.type === "blob" && newEntry.type === "blob") {
+			const counts = await countBlobLineChanges(repoPath, oldEntry.oid, newEntry.oid);
+			out.push({ path: filePath, added: counts.added, deleted: counts.deleted, status: "M" });
+			return;
+		}
+
+		if (oldEntry.type === "tree" || newEntry.type === "tree") {
+			out.push({ path: filePath, added: 0, deleted: 0, status: "T" });
+			return;
+		}
+
+		out.push({ path: filePath, added: 0, deleted: 0, status: "M" });
+		return;
+	}
+
+	if (newEntry !== null) {
+		if (newEntry.type === "tree") {
+			await diffTreeStats(repoPath, null, newEntry.oid, filePath, out);
+			return;
+		}
+
+		if (newEntry.type === "blob") {
+			const blob = await readBlobByOid(repoPath, newEntry.oid);
+			const added = blob === null || isBinaryBlob(blob) ? 0 : countTextLines(decodeBlob(blob));
+			out.push({ path: filePath, added, deleted: 0, status: "A" });
+			return;
+		}
+
+		out.push({ path: filePath, added: 0, deleted: 0, status: "A" });
+		return;
+	}
+
+	if (oldEntry !== null) {
+		if (oldEntry.type === "tree") {
+			await diffTreeStats(repoPath, oldEntry.oid, null, filePath, out);
+			return;
+		}
+
+		if (oldEntry.type === "blob") {
+			const blob = await readBlobByOid(repoPath, oldEntry.oid);
+			const deleted = blob === null || isBinaryBlob(blob) ? 0 : countTextLines(decodeBlob(blob));
+			out.push({ path: filePath, added: 0, deleted, status: "D" });
+			return;
+		}
+
+		out.push({ path: filePath, added: 0, deleted: 0, status: "D" });
+	}
+}
+
+async function readTreeEntries(repoPath: string, oid: string | null): Promise<TreeEntry[]> {
+	if (oid === null) return [];
+	try {
+		const result = await git.readTree({ fs: nodeFs, dir: repoPath, oid });
+		return result.tree;
+	} catch (err) {
+		if (isNotFoundError(err)) {
+			logger.debug("file diff failed", { repo: repoPath, path: oid, error: String(err) });
+			return [];
+		}
+		throw err;
+	}
+}
+
+async function countBlobLineChanges(
+	repoPath: string,
+	oldOid: string | null,
+	newOid: string | null,
 ): Promise<LineChange> {
 	const [oldBlob, newBlob] = await Promise.all([
-		readBlobForEntry(repoPath, oldInfo),
-		readBlobForEntry(repoPath, newInfo),
+		oldOid === null ? null : readBlobByOid(repoPath, oldOid),
+		newOid === null ? null : readBlobByOid(repoPath, newOid),
 	]);
 	if ((oldBlob !== null && isBinaryBlob(oldBlob)) || (newBlob !== null && isBinaryBlob(newBlob))) {
 		return { added: 0, deleted: 0 };
@@ -471,38 +531,17 @@ async function countEntryLineChanges(
 	return countLineChanges(decodeBlob(oldBlob), decodeBlob(newBlob));
 }
 
-async function readBlobForEntry(repoPath: string, info: EntryInfo | null): Promise<Uint8Array | null> {
-	if (info === null || info.type !== "blob") return null;
+async function readBlobByOid(repoPath: string, oid: string): Promise<Uint8Array | null> {
 	try {
-		const result = await git.readBlob({ fs: nodeFs, dir: repoPath, oid: info.oid });
+		const result = await git.readBlob({ fs: nodeFs, dir: repoPath, oid });
 		return result.blob;
 	} catch (err) {
-		if (isNotFoundError(err)) return null;
+		if (isNotFoundError(err)) {
+			logger.debug("file diff failed", { repo: repoPath, path: oid, error: String(err) });
+			return null;
+		}
 		throw err;
 	}
-}
-
-function collectDiffStats(value: unknown, stats: FileDiffStat[]): void {
-	if (Array.isArray(value)) {
-		for (const item of value) {
-			collectDiffStats(item, stats);
-		}
-		return;
-	}
-	if (isFileDiffStat(value)) {
-		stats.push(value);
-	}
-}
-
-function isFileDiffStat(value: unknown): value is FileDiffStat {
-	if (typeof value !== "object" || value === null) return false;
-	const candidate = value as Partial<FileDiffStat>;
-	return (
-		typeof candidate.path === "string" &&
-		typeof candidate.added === "number" &&
-		typeof candidate.deleted === "number" &&
-		(candidate.status === "A" || candidate.status === "M" || candidate.status === "D" || candidate.status === "T")
-	);
 }
 
 function countLineChanges(oldText: string, newText: string): LineChange {
